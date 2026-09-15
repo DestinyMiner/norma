@@ -94,6 +94,16 @@ async def _read_file(path: str, max_bytes: int = 64000) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
+        # 按字节截断可能正好切在多字节字符中间——中文文本里这很常见（每字 3 字节）。
+        # 回退到最后一个完整字符边界，而不是把整份中文文本误报成二进制文件：
+        # 错误的诊断比含糊的诊断更糟，模型会据此放弃这个文件。
+        for backoff in (1, 2, 3):
+            if len(data) <= backoff:
+                break
+            try:
+                return data[:-backoff].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
 
 

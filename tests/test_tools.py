@@ -1,7 +1,4 @@
-import json
 import logging
-
-import pytest
 
 from norma.tools import (
     MAX_RESULT_CHARS, TOOLS, Risk, Tool, openai_schema, tools_schema, truncate,
@@ -92,3 +89,13 @@ async def test_read_file_binary_is_reported_not_crashed(tmp_path):
     f.write_bytes(b"\xff\xfe\x00\x01")
     out = await TOOLS["read_file"].fn(path=str(f))
     assert "无法按 UTF-8 解码" in out
+
+
+async def test_read_file_truncation_mid_character_is_not_reported_as_binary(tmp_path):
+    """中文文本按字节截断时不该被误报成二进制文件（每字 3 字节）。"""
+    f = tmp_path / "cn.txt"
+    f.write_text("中文测试" * 100, encoding="utf-8")
+    # 10 字节 = 3 个完整汉字（9 字节）+ 第 4 个字的第 1 个字节
+    out = await TOOLS["read_file"].fn(path=str(f), max_bytes=10)
+    assert "无法按 UTF-8 解码" not in out
+    assert out.startswith("中文测")
