@@ -1,0 +1,9 @@
+.env
+norma.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
