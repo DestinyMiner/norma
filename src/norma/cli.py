@@ -1,0 +1,85 @@
+"""最笨的客户端：渲染事件流，并实现 ask_permission。
+
+它不知道循环内部如何工作。以后 Electron 接上来时，把 render 里的 print
+换成 websocket.send 即可，内核一行不动。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+from .agent import Agent
+from .config import Config
+from .events import Event, Failed, Finished, TextDelta, ToolCallStarted, ToolResult
+from .llm import LLM
+from .tools import Tool
+
+LOG_PATH = "norma.log"
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        filename=LOG_PATH,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        encoding="utf-8",
+    )
+
+
+async def ask_in_terminal(tool: Tool, args: dict) -> bool:
+    prompt = f"\n⚠ 允许执行 [{tool.risk}] {tool.name} 吗？\n  参数：{args}\n  输入 y 允许："
+    answer = await asyncio.to_thread(input, prompt)
+    return answer.strip().lower() == "y"
+
+
+def render(event: Event) -> None:
+    match event:
+        case TextDelta(text=text):
+            print(text, end="", flush=True)
+        case ToolCallStarted(name=name):
+            print(f"\n[调用 {name}]", flush=True)
+        case ToolResult(name=name, ok=ok, content=content):
+            mark = "✓" if ok else "✗"
+            first_line = content.strip().splitlines()[0] if content.strip() else ""
+            print(f"[{mark} {name}] {first_line[:200]}", flush=True)
+        case Finished():
+            # 正文已随 TextDelta 流式打印过，这里只收尾
+            print()
+        case Failed(reason=reason):
+            print(f"\n[失败] {reason}", file=sys.stderr)
+
+
+async def repl(agent: Agent) -> None:
+    print(f"norma 已就绪（审计日志：{LOG_PATH}）。直接输入内容开始对话，空行退出。")
+    while True:
+        try:
+            line = (await asyncio.to_thread(input, "\n你> ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            return
+        async for event in agent.run(line):
+            render(event)
+
+
+def main() -> None:
+    setup_logging()
+
+    try:
+        config = Config.from_env()
+    except RuntimeError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    agent = Agent(
+        llm=LLM(config),
+        ask_permission=ask_in_terminal,
+        max_steps=config.max_steps,
+    )
+
+    try:
+        asyncio.run(repl(agent))
+    except KeyboardInterrupt:
+        print()
