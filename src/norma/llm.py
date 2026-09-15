@@ -14,6 +14,10 @@ from openai import AsyncOpenAI
 from .config import Config
 from .events import TextDelta
 
+# openai SDK 默认 600 秒超时 + 2 次重试：网络卡住时 CLI 会静默假死半小时，
+# 对每天用的终端助手来说与死机无异。
+REQUEST_TIMEOUT_S = 60.0
+
 
 @dataclass
 class ToolCall:
@@ -115,7 +119,10 @@ def assemble(chunks: list) -> Reply:
 class LLM:
     def __init__(self, config: Config) -> None:
         self._client = AsyncOpenAI(
-            base_url=config.base_url, api_key=config.api_key)
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=REQUEST_TIMEOUT_S,
+        )
         self._model = config.model
 
     async def chat(

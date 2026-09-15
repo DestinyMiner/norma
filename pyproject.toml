@@ -4,13 +4,17 @@ version = "0.1.0"
 description = "个人 AI 助手基站的内核"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=1.40",
+    # >=3 是硬要求：tests/test_llm.py 用 httpx2.MockTransport 离线验证请求体，
+    # 而 httpx2 是 openai 3.x 才引入的 HTTP 客户端；1.x 下测试连收集都会失败。
+    "openai>=3.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# httpx2 显式声明：测试直接 import 它，不该听凭它偶然随 openai 传递而来。
+# 版本区间与 openai 3.14.0 自身的约束一致。
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx2>=2.7"]
 
 [project.scripts]
 norma = "norma.cli:main"

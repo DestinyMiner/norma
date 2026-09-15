@@ -86,8 +86,11 @@ class Agent:
 
         for _ in range(self.max_steps):
             reply = None
+            # schema 生成放在 try 之外：它是我们自己的代码，出错属代码 bug，应当抛出，
+            # 而不是被下面的 except 伪装成一次"模型调用失败"——那会把真正的病因藏起来。
+            schemas = tools_schema(self.tools)
             try:
-                async for item in self.llm.chat(self.messages, tools_schema(self.tools)):
+                async for item in self.llm.chat(self.messages, schemas):
                     if isinstance(item, TextDelta):
                         yield item
                     else:

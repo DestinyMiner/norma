@@ -31,7 +31,7 @@ NORMA_MODEL=deepseek-chat
 NORMA_MAX_STEPS=25
 ```
 
-`NORMA_BASE_URL` 指向任何 OpenAI 兼容端点，换模型只需改这里。
+`NORMA_BASE_URL` 指向任何 OpenAI 兼容端点，换服务商只需改这里（**模型名见 `NORMA_MODEL`**）。
 
 ## 使用
 

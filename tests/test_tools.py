@@ -110,6 +110,16 @@ async def test_read_file_truncation_mid_character_is_not_reported_as_binary(tmp_
     assert out.startswith("中文测")
 
 
+async def test_untruncated_binary_file_is_reported_as_binary(tmp_path):
+    """未截断时不该走回退路径——否则末字节非法的二进制会被当成文本返回。"""
+    f = tmp_path / "b.bin"
+    f.write_bytes(b"abc\xff\xfe")
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert "无法按 UTF-8 解码" in out
+
+
 # ---------- write_file ----------
 
 async def test_write_file_creates_parent_directories(tmp_path):
@@ -170,3 +180,14 @@ async def test_run_powershell_timeout_kills_process():
     out = await TOOLS["run_powershell"].fn(
         command="Start-Sleep -Seconds 30", timeout_s=1)
     assert "超时" in out
+
+
+async def test_run_powershell_does_not_inherit_the_api_key(monkeypatch):
+    """子进程环境里不能有 NORMA_*：否则一句 env: 就能把密钥打进日志与会话。"""
+    monkeypatch.setenv("NORMA_API_KEY", "sk-secret-must-not-leak")
+
+    out = await TOOLS["run_powershell"].fn(
+        command='Write-Output "key=[$env:NORMA_API_KEY]"')
+
+    assert "sk-secret-must-not-leak" not in out
+    assert "key=[]" in out

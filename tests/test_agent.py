@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from pydantic import BaseModel, Field
 
 from norma.agent import Agent, ExecResult
@@ -358,3 +360,25 @@ async def test_finished_text_is_not_duplicated_into_messages_twice():
 
     assert [m["role"] for m in agent.messages] == ["user", "assistant"]
     assert agent.messages[1]["content"] == "答案"
+
+
+async def test_schema_generation_failure_raises_instead_of_masquerading():
+    """schema 生成是我们自己的代码 bug，必须抛出，不能被伪装成"模型调用失败"。
+
+    伪装会同时造成两件坏事：病史被藏起来，而且 Failed 事件会让调用方以为
+    是网络问题去重试。
+    """
+
+    class ExplodingParams(BaseModel):
+        @classmethod
+        def model_json_schema(cls, *args, **kwargs):
+            raise RuntimeError("schema 生成失败")
+
+    async def _noop() -> str:
+        return ""
+
+    tools = {"bad": Tool("bad", "坏工具", ExplodingParams, Risk.READ, _noop)}
+    agent = scripted([reply("好")], tools=tools)
+
+    with pytest.raises(RuntimeError, match="schema 生成失败"):
+        [event async for event in agent.run("hi")]

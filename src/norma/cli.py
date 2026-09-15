@@ -39,7 +39,17 @@ def setup_logging() -> None:
 
 async def ask_in_terminal(tool: Tool, args: dict) -> bool:
     prompt = f"\n⚠ 允许执行 [{tool.risk}] {tool.name} 吗？\n  参数：{args}\n  输入 y 允许："
-    answer = await asyncio.to_thread(input, prompt)
+    try:
+        answer = await asyncio.to_thread(input, prompt)
+    except (EOFError, KeyboardInterrupt):
+        # Ctrl-C（或 stdin 关闭）落在提问上时按**拒绝**处理，理由有三：
+        #   1. 不批准——权限闸门的默认必须是拒绝，不是放行；
+        #   2. KeyboardInterrupt 是 BaseException，会穿透内核所有 except Exception
+        #      把整个会话带走，而用户的本意只是"这次不要执行"；
+        #   3. to_thread 的工作线程仍卡在 input() 里，事件循环关闭时会 join 它，
+        #      进程于是挂住直到用户再按一次回车。
+        print()
+        return False
     return answer.strip().lower() == "y"
 
 

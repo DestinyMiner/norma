@@ -167,3 +167,16 @@ async def test_chat_sends_tools_key_when_tools_present():
     async for _ in llm.chat([{"role": "user", "content": "x"}], _tools()):
         pass
     assert captured["body"]["tools"] == _tools()
+
+
+def test_client_has_a_finite_request_timeout():
+    """SDK 默认 600 秒 + 重试，网络卡住时 CLI 会静默假死半小时。
+
+    这里断言的是我们**确实设了**一个远小于默认值的超时。若 SDK 内部把
+    数值规范化成别的形态，就断言它规范化后的实际值，不要删掉这条断言。
+    """
+    from norma.llm import REQUEST_TIMEOUT_S
+
+    llm = LLM(Config(base_url="https://example.invalid/v1", api_key="sk-x", model="m"))
+    assert REQUEST_TIMEOUT_S <= 60.0
+    assert llm._client.timeout == REQUEST_TIMEOUT_S
