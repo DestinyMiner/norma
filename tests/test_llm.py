@@ -1,0 +1,107 @@
+import json
+
+from types import SimpleNamespace as NS
+
+from norma.llm import Reply, ToolCall, assemble
+
+
+def chunk(content=None, tool_calls=None):
+    """伪造一个流式 chunk。tool_calls=None 表示这一片没有工具调用。"""
+    return NS(choices=[NS(delta=NS(content=content, tool_calls=tool_calls))])
+
+
+def tc(index, id=None, name=None, arguments=None):
+    """伪造一个 tool_call 分片。真实 API 里，同一 index 的首片带 id 和 name，
+    后续片这两项为 None，只有 arguments 继续追加。"""
+    return NS(index=index, id=id, function=NS(name=name, arguments=arguments))
+
+
+def test_text_only_stream():
+    reply = assemble([chunk("你"), chunk("好"), chunk("！")])
+    assert reply.content == "你好！"
+    assert reply.tool_calls == []
+
+
+def test_empty_choices_chunk_is_ignored():
+    # 收尾 chunk 常常带 usage 且 choices 为空
+    reply = assemble([chunk("嗨"), NS(choices=[])])
+    assert reply.content == "嗨"
+    assert reply.tool_calls == []
+
+
+def test_single_tool_call_arriving_in_one_chunk():
+    reply = assemble([
+        chunk(tool_calls=[tc(0, id="c1", name="list_dir", arguments='{"path": "."}')]),
+    ])
+    assert len(reply.tool_calls) == 1
+    assert reply.tool_calls[0] == ToolCall(id="c1", name="list_dir", args={"path": "."})
+
+
+def test_tool_call_arguments_fragmented_across_chunks():
+    """参数被拆成字符串碎片——这是真实 API 的常态。"""
+    reply = assemble([
+        chunk(tool_calls=[tc(0, id="c1", name="write_file", arguments='{"pa')]),
+        chunk(tool_calls=[tc(0, arguments='th": "a.tx')]),
+        chunk(tool_calls=[tc(0, arguments='t", "content": "哈"}')]),
+    ])
+    assert len(reply.tool_calls) == 1
+    assert reply.tool_calls[0].args == {"path": "a.txt", "content": "哈"}
+    assert reply.tool_calls[0].args_error == ""
+
+
+def test_later_chunks_have_no_id_or_name():
+    """首片之后 id / name 为 None。写成赋值而非累加会把已取到的工具名清空。"""
+    reply = assemble([
+        chunk(tool_calls=[tc(0, id="c1", name="read_file", arguments='{"path"')]),
+        chunk(tool_calls=[tc(0, id=None, name=None, arguments=': "x.txt"}')]),
+    ])
+    assert reply.tool_calls[0].name == "read_file"
+    assert reply.tool_calls[0].id == "c1"
+    assert reply.tool_calls[0].args == {"path": "x.txt"}
+
+
+def test_two_tool_calls_interleaved_by_index():
+    reply = assemble([
+        chunk(tool_calls=[tc(0, id="c1", name="list_dir", arguments='{"path"')]),
+        chunk(tool_calls=[tc(1, id="c2", name="read_file", arguments='{"pa')]),
+        chunk(tool_calls=[tc(0, arguments=': "."}')]),
+        chunk(tool_calls=[tc(1, arguments='th": "b.txt"}')]),
+    ])
+    assert [c.id for c in reply.tool_calls] == ["c1", "c2"]
+    assert reply.tool_calls[0].args == {"path": "."}
+    assert reply.tool_calls[1].args == {"path": "b.txt"}
+
+
+def test_truncated_arguments_record_args_error():
+    """max_tokens 截断会让 arguments 断在半截。"""
+    reply = assemble([
+        chunk(tool_calls=[tc(0, id="c1", name="write_file", arguments='{"path": "a.tx')]),
+    ])
+    assert reply.tool_calls[0].args_error != ""
+    assert reply.tool_calls[0].args == {}
+
+
+def test_empty_arguments_string_gives_empty_dict():
+    reply = assemble([chunk(tool_calls=[tc(0, id="c1", name="noop", arguments="")])])
+    assert reply.tool_calls[0].args == {}
+    assert reply.tool_calls[0].args_error == ""
+
+
+def test_to_message_serializes_arguments_as_json_string():
+    reply = Reply(content="", tool_calls=[ToolCall(id="c1", name="t", args={"a": 1})])
+    msg = reply.to_message()
+    assert msg["role"] == "assistant"
+    raw = msg["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(raw, str)
+    assert json.loads(raw) == {"a": 1}
+
+
+def test_to_message_keeps_empty_content_as_none():
+    reply = Reply(content="", tool_calls=[ToolCall(id="c1", name="t", args={})])
+    assert reply.to_message()["content"] is None
+
+
+def test_reply_without_tool_calls_omits_the_key():
+    """空 tool_calls 数组在部分服务端会被判为非法，干脆不带这个键。"""
+    msg = Reply(content="你好").to_message()
+    assert msg == {"role": "assistant", "content": "你好"}
