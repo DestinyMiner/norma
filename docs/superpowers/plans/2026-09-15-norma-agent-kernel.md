@@ -1266,7 +1266,8 @@ git commit -m "feat: 权限闸门"
 - Consumes: `norma.events`、`norma.llm.ToolCall`、`norma.permission.check`、`norma.tools.{Tool, TOOLS, truncate, audit}`
 - Produces:
   - `norma.agent.ExecResult`（dataclass：`ok: bool`、`content: str`）
-  - `norma.agent.Agent.__init__(self, llm, tools: dict[str, Tool], ask_permission, max_steps: int = 25)`
+  - `norma.agent.Agent.__init__(self, llm, ask_permission: AskPermission, tools: dict[str, Tool] | None = None, max_steps: int = DEFAULT_MAX_STEPS)`
+    —— **`ask_permission` 是第二个位置参数且必填**。调用方一律用关键字传参，避免位置错配。
   - `norma.agent.Agent.execute(call: ToolCall) -> ExecResult`（**永不抛异常**）
   - `norma.agent.Agent.messages: list[dict]`
 
@@ -1522,7 +1523,7 @@ class Agent:
 
 Run: `python -m pytest tests/test_agent.py -v`
 
-Expected: PASS — 13 passed
+Expected: PASS — 12 passed
 
 - [ ] **Step 5: 提交**
 
