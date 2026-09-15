@@ -540,6 +540,57 @@ class FakeLLM:
 
 「将来给其他人一起使用」时的边界。**其中两条约束 v1 的实现纪律**，故记录在案。
 
+### 仓库边界 ≠ 安装边界
+
+**内核独立成仓，不等于用户要装两次。** 打包时内核作为 **sidecar（随行进程）** 嵌入客户端安装包：
+
+```
+norma 仓（内核）
+   └─发布─→ norma-kernel-0.1.0-win-x64.exe     ← PyInstaller 冻结的独立可执行文件
+                     │
+Electron 仓 ─构建时下载并锁定版本─┘
+                     │
+                     └─ electron-builder 的 extraResources 打进安装包
+                                 │
+                   用户装一份安装包 ──→ 内核作为子进程被拉起
+```
+
+用户从头到尾看不到 Python，也不需要单独安装内核。
+
+冻结内核的三种做法：
+
+| 做法 | 说明 | 取舍 |
+|---|---|---|
+| **PyInstaller / Nuitka 冻结** | 内核编译成独立 `.exe` | **推荐**。最简单，`extraResources` 直接打包 |
+| 内嵌 Python（python-embed） | 随包带解释器与依赖 | 文件多，但没有冻结带来的怪问题 |
+| 要求用户自装 Python | ❌ | 没人会为了用个助手去装 Python |
+
+选 PyInstaller 的理由：依赖只有 `openai` / `pydantic` / `python-dotenv`，全是纯 Python 或带预编译 wheel 的，冻结难度低。已知小摩擦：`pydantic-core` 是 Rust 扩展，PyInstaller 偶尔需要 `--collect-all pydantic_core`。这也是 §5 选 `src/` 布局的第二个理由——冻结工具对包发现敏感。
+
+这是标准实践，不是自创：Ollama、LM Studio、Docker Desktop、VS Code 都是「一份安装包里塞运行时」。
+
+### 为什么内核仍然必须独立成仓
+
+仓库边界跟随**依赖方向**，不是安装边界：
+
+```
+        ┌─→ Electron 仓 ─┐
+内核仓 ─┼─→ Android 仓  ─┼─→ 三者都依赖内核，内核不认识任何一个
+        └─→ 鸿蒙仓      ─┘
+```
+
+- 三个客户端依赖一个内核 → 内核必须能**独立版本化、独立测试、独立发版**；否则手机端修个 bug 要动桌面端的发布流程
+- **Android 与鸿蒙客户端无法从 Electron 仓构建**。内核若住在 Electron 仓里，手机端将依赖一个桌面应用仓库——荒谬
+- 内核是唯一承担安全责任的部分，需要自己的测试与发布纪律
+
+### 内核的存活不得绑定在 Electron 上
+
+§1 已定：手机关掉桌面窗口也必须能连上内核。因此内核**不能**是随 Electron 退出而死的子进程。
+
+做法：Electron 以 **detached** 方式拉起内核 + 注册开机自启（或直接注册为 Windows 服务）。Electron 只是连接方与守护方，不是内核的宿主。
+
+属于传输层里程碑，v1 不涉及，但记录在案以免打包时才发现。
+
 ### Tool 与 Skill 不是一回事
 
 | | 是什么 | 可否集中分发 |
