@@ -118,8 +118,15 @@ class WriteFileParams(BaseModel):
 
 async def _write_file(path: str, content: str) -> str:
     target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    if target.is_dir():
+        return f"不是文件（是一个目录）：{target}"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        # 磁盘满、ACL 拒绝、父路径与已存在的文件同名……都归为"一次失败的写入"
+        # 而不是异常：与 _list_dir / _read_file 的约定一致。
+        return f"写入失败：{target}（{exc}）"
     return f"已写入 {target}（{len(content)} 字符）"
 
 

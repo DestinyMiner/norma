@@ -117,6 +117,22 @@ async def test_write_file_overwrites(tmp_path):
     assert target.read_text(encoding="utf-8") == "新"
 
 
+async def test_write_file_rejects_a_directory_path(tmp_path):
+    target = tmp_path / "adir"
+    target.mkdir()
+    out = await TOOLS["write_file"].fn(path=str(target), content="x")
+    assert out.startswith("不是文件")
+    assert target.is_dir()  # 目录没有被破坏
+
+
+async def test_write_file_reports_oserror_instead_of_raising(tmp_path):
+    """父路径撞上已存在的文件：返回中文说明，而不是抛异常。"""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("我是文件", encoding="utf-8")
+    out = await TOOLS["write_file"].fn(path=str(blocker / "x.txt"), content="y")
+    assert "写入失败" in out
+
+
 # ---------- run_powershell ----------
 
 async def test_run_powershell_captures_stdout():
