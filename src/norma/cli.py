@@ -25,6 +25,16 @@ def setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         encoding="utf-8",
     )
+    # stdout 被重定向（`norma > out.txt`）时，Windows 按本地代码页（本机 GBK）编码，
+    # 于是 ✓/✗/⚠ 以及工具输出里任何超出 GBK 的字符（emoji 文件名之类）都会让 print
+    # 直接抛 UnicodeEncodeError 把程序打崩。显式改成 UTF-8 并允许替换：
+    #   * 交互式终端：Python 本来就用 UTF-8 + WriteConsoleW，这里是空操作
+    #   * 重定向：输出为 UTF-8，不再崩，符号也保留
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass  # 流被换成不支持 reconfigure 的对象时跳过，不能因此影响主流程
 
 
 async def ask_in_terminal(tool: Tool, args: dict) -> bool:
