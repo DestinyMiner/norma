@@ -1,7 +1,9 @@
 """工具定义、注册表，以及 v1 的本机工具实现。"""
 from __future__ import annotations
 
+import asyncio
 import logging
+import shutil
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -107,6 +109,66 @@ async def _read_file(path: str, max_bytes: int = 64000) -> str:
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
 
 
+# ---------- write_file ----------
+
+class WriteFileParams(BaseModel):
+    path: str = Field(..., description="要写入的文件路径")
+    content: str = Field(..., description="文件内容（覆盖写入）")
+
+
+async def _write_file(path: str, content: str) -> str:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"已写入 {target}（{len(content)} 字符）"
+
+
+# ---------- run_powershell ----------
+
+# PowerShell 在中文 Windows 上默认按 GBK/UTF-16 输出，直接按 UTF-8 解码会糊。
+_SHELL = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+
+# 强制子进程按 UTF-8 输出，否则中文文件名与中文输出全是乱码。
+_UTF8_PREAMBLE = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+
+# ponytail: _UTF8_PREAMBLE 只设了 [Console]::OutputEncoding，它覆盖 PowerShell
+#           cmdlet 与 .NET 的写入（Console.Error 与 Console.Out 共用该编码），
+#           所以本文件的两个编码测试能过。但**原生命令**（如 cmd /c dir）走
+#           自己的代码页，中文仍可能糊。真遇到时再让命令显式输出 UTF-8，
+#           或按 [Text.Encoding]::GetEncoding(936) 解码。
+
+
+class RunPowershellParams(BaseModel):
+    command: str = Field(..., description="要执行的 PowerShell 命令")
+    timeout_s: int = Field(60, description="超时秒数，超时会终止进程")
+
+
+async def _run_powershell(command: str, timeout_s: int = 60) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        _SHELL, "-NoProfile", "-NonInteractive", "-Command",
+        f"{_UTF8_PREAMBLE} {command}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return f"命令超时（{timeout_s} 秒）已终止：{command}"
+
+    parts = []
+    text = stdout.decode("utf-8", "replace").rstrip()
+    if text:
+        parts.append(text)
+    errtext = stderr.decode("utf-8", "replace").rstrip()
+    if errtext:
+        parts.append(f"[stderr]\n{errtext}")
+    if proc.returncode:
+        parts.append(f"[退出码 {proc.returncode}]")
+    return "\n".join(parts) if parts else "（无输出）"
+
+
 TOOLS: dict[str, Tool] = {
     tool.name: tool
     for tool in [
@@ -123,6 +185,20 @@ TOOLS: dict[str, Tool] = {
             params=ReadFileParams,
             risk=Risk.READ,
             fn=_read_file,
+        ),
+        Tool(
+            name="write_file",
+            description="写入文本文件，覆盖已有内容，父目录会自动创建。",
+            params=WriteFileParams,
+            risk=Risk.WRITE,
+            fn=_write_file,
+        ),
+        Tool(
+            name="run_powershell",
+            description="在这台 Windows 电脑上执行 PowerShell 命令并返回输出。",
+            params=RunPowershellParams,
+            risk=Risk.EXEC,
+            fn=_run_powershell,
         ),
     ]
 }

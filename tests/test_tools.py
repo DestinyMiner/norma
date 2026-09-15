@@ -99,3 +99,49 @@ async def test_read_file_truncation_mid_character_is_not_reported_as_binary(tmp_
     out = await TOOLS["read_file"].fn(path=str(f), max_bytes=10)
     assert "无法按 UTF-8 解码" not in out
     assert out.startswith("中文测")
+
+
+# ---------- write_file ----------
+
+async def test_write_file_creates_parent_directories(tmp_path):
+    target = tmp_path / "a" / "b" / "c.txt"
+    out = await TOOLS["write_file"].fn(path=str(target), content="内容")
+    assert target.read_text(encoding="utf-8") == "内容"
+    assert "已写入" in out
+
+
+async def test_write_file_overwrites(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("旧", encoding="utf-8")
+    await TOOLS["write_file"].fn(path=str(target), content="新")
+    assert target.read_text(encoding="utf-8") == "新"
+
+
+# ---------- run_powershell ----------
+
+async def test_run_powershell_captures_stdout():
+    out = await TOOLS["run_powershell"].fn(command="Write-Output hello")
+    assert "hello" in out
+
+
+async def test_run_powershell_handles_chinese_output():
+    """中文 Windows 上 PowerShell 默认输出编码不是 UTF-8，会糊成乱码。"""
+    out = await TOOLS["run_powershell"].fn(command='Write-Output "中文测试"')
+    assert "中文测试" in out
+
+
+async def test_run_powershell_reports_nonzero_exit_code():
+    out = await TOOLS["run_powershell"].fn(command="exit 3")
+    assert "退出码 3" in out
+
+
+async def test_run_powershell_captures_stderr():
+    out = await TOOLS["run_powershell"].fn(
+        command='[Console]::Error.WriteLine("出错了")')
+    assert "出错了" in out
+
+
+async def test_run_powershell_timeout_kills_process():
+    out = await TOOLS["run_powershell"].fn(
+        command="Start-Sleep -Seconds 30", timeout_s=1)
+    assert "超时" in out
