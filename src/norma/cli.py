@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 
 from .agent import Agent
 from .config import Config
@@ -37,17 +38,52 @@ def setup_logging() -> None:
             pass  # 流被换成不支持 reconfigure 的对象时跳过，不能因此影响主流程
 
 
+def _finish(future: asyncio.Future, value: object) -> None:
+    # 主任务可能已被取消（future 已 done），此时静默丢弃即可。
+    if not future.done():
+        future.set_result(value)
+
+
+async def _read_line(prompt: str) -> str:
+    """在一个**守护线程**里读一行输入。
+
+    这里不能用 ``asyncio.to_thread``：默认执行器的工作线程会被事件循环在关闭时
+    join（Python 3.12+ 有 300 秒上限，3.11 无上限），而该线程卡在 ``input()`` 里
+    等用户回车——于是 Ctrl-C 之后终端会僵住直到用户随手敲一下回车。
+    实测：park 4 秒的工作线程会让 ``asyncio.run`` 的退出也拖满 4 秒。
+
+    守护线程在解释器退出时被直接丢弃，不参与 join，因此 Ctrl-C 能立刻退出。
+    代价是那次 Ctrl-C 会**中止本轮对话**（CancelledError 按取消语义向上传播，
+    这是正确的），而不是把它变成一次"拒绝"——后者需要吞掉 CancelledError，
+    那会破坏取消语义，不值得。stdin 被关闭（EOF）这类由工作线程自身抛出的异常
+    仍会被 ask_in_terminal 转成拒绝。
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+
+    def worker() -> None:
+        try:
+            line = input(prompt)
+        except BaseException as exc:  # noqa: BLE001 — 原样转交等待方判定
+            loop.call_soon_threadsafe(_finish, future, exc)
+        else:
+            loop.call_soon_threadsafe(_finish, future, line)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    result = await future
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 async def ask_in_terminal(tool: Tool, args: dict) -> bool:
     prompt = f"\n⚠ 允许执行 [{tool.risk}] {tool.name} 吗？\n  参数：{args}\n  输入 y 允许："
     try:
-        answer = await asyncio.to_thread(input, prompt)
+        answer = await _read_line(prompt)
     except (EOFError, KeyboardInterrupt):
-        # Ctrl-C（或 stdin 关闭）落在提问上时按**拒绝**处理，理由有三：
-        #   1. 不批准——权限闸门的默认必须是拒绝，不是放行；
-        #   2. KeyboardInterrupt 是 BaseException，会穿透内核所有 except Exception
-        #      把整个会话带走，而用户的本意只是"这次不要执行"；
-        #   3. to_thread 的工作线程仍卡在 input() 里，事件循环关闭时会 join 它，
-        #      进程于是挂住直到用户再按一次回车。
+        # stdin 被关闭或工作线程自身收到中断时按**拒绝**处理：不批准，
+        # 也不让异常把整个会话带走。
         print()
         return False
     return answer.strip().lower() == "y"
