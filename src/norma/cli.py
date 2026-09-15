@@ -22,10 +22,15 @@ LOG_PATH = "norma.log"
 def setup_logging() -> None:
     logging.basicConfig(
         filename=LOG_PATH,
-        level=logging.INFO,
+        # 根日志只留 WARNING 以上：httpx2 会为**每个** HTTP 请求打一条 INFO，
+        # 落进 norma.log 就会把"助手到底做了什么"淹在传输层噪音里——
+        # 而查这份日志正是这个文件存在的理由。
+        level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(message)s",
         encoding="utf-8",
     )
+    # 我们自己的审计日志要 INFO，显式打开，否则会被上面的根级别一并挡掉。
+    logging.getLogger("norma.audit").setLevel(logging.INFO)
     # stdout 被重定向（`norma > out.txt`）时，Windows 按本地代码页（本机 GBK）编码，
     # 于是 ✓/✗/⚠ 以及工具输出里任何超出 GBK 的字符（emoji 文件名之类）都会让 print
     # 直接抛 UnicodeEncodeError 把程序打崩。显式改成 UTF-8 并允许替换：

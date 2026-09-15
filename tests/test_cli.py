@@ -134,3 +134,59 @@ def test_read_line_drops_a_late_answer_after_the_loop_is_closed(monkeypatch):
     time.sleep(0.3)
 
     assert unhandled == [], f"工作线程里抛出了未处理异常：{unhandled}"
+
+
+def test_third_party_info_does_not_pollute_the_audit_log(tmp_path, monkeypatch):
+    """httpx2 为每个 HTTP 请求打一条 INFO；根级别若为 INFO，审计日志就被传输层噪音淹没。
+
+    用户查 norma.log 是为了知道助手到底做了什么，所以这条不是洁癖。
+    """
+    import logging
+
+    from norma import cli
+
+    monkeypatch.chdir(tmp_path)
+    cli.setup_logging()
+
+    assert logging.getLogger().level == logging.WARNING
+    assert logging.getLogger("norma.audit").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("httpx2").isEnabledFor(logging.INFO)
+
+
+def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
+    """上一条测试在 pytest 里会"因为错误的理由通过"——这条守的才是真正的行为。
+
+    logging.basicConfig() 只要看到根 logger 上已有 handler 就**整个跳过**，
+    level= 一并忽略；而 pytest 自己会往根上挂 handler（实测 4 个），根 logger 的
+    默认级别又本来就是 WARNING。两者叠加的结果是：把 level 改回 INFO，上一条测试
+    仍然全绿——它测的是 Python 的默认值，不是我们的配置。
+
+    这里把根 handler 暂时摘掉，让 basicConfig 真正生效，也就是真实 CLI 进程里的
+    情形（那里根上没有任何 handler）。用完在 finally 里原样恢复。
+    """
+    import logging
+
+    from norma import cli
+
+    monkeypatch.chdir(tmp_path)
+
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    saved_audit = logging.getLogger("norma.audit").level
+
+    root.handlers[:] = []          # 否则 basicConfig 直接跳过
+    root.setLevel(logging.NOTSET)  # 清掉 WARNING 默认值，逼出真实配置
+    try:
+        cli.setup_logging()
+
+        assert root.level == logging.WARNING
+        assert logging.getLogger("norma.audit").isEnabledFor(logging.INFO)
+        assert not logging.getLogger("httpx2").isEnabledFor(logging.INFO)
+    finally:
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+            handler.close()
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+        logging.getLogger("norma.audit").setLevel(saved_audit)
