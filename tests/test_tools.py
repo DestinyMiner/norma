@@ -20,6 +20,15 @@ def test_tools_schema_covers_every_registered_tool():
     assert names == set(TOOLS)
 
 
+def test_tools_schema_with_empty_registry_is_empty():
+    """空注册表是合法输入，不得悄悄回落到全局 TOOLS。
+
+    这条守的是 `registry is None` 与真值判断的区别：Agent(tools={}) 表示
+    "没有工具"，若回落成全局注册表，模型会被展示它根本调不到的工具。
+    """
+    assert tools_schema({}) == []
+
+
 def test_every_tool_params_model_has_a_schema():
     for name, tool in TOOLS.items():
         assert tool.params.model_json_schema(), name
