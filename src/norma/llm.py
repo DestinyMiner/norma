@@ -125,8 +125,11 @@ class LLM:
         stream = await self._client.chat.completions.create(
             model=self._model,
             messages=messages,
-            tools=tools or None,
             stream=True,
+            # 没有工具时**不带这个键**——不是传 None。实测 openai 3.14.0 会把
+            # tools=None 原样序列化成 "tools": null 上线，而严格校验的兼容网关
+            # 会因此返回 400。条件展开让"没有工具"真的等于"没有这个键"。
+            **({"tools": tools} if tools else {}),
         )
         collected = []
         async for chunk in stream:

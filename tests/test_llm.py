@@ -2,7 +2,12 @@ import json
 
 from types import SimpleNamespace as NS
 
-from norma.llm import Reply, ToolCall, assemble
+import httpx2
+
+from openai import AsyncOpenAI
+
+from norma.config import Config
+from norma.llm import LLM, Reply, ToolCall, assemble
 
 
 def chunk(content=None, tool_calls=None):
@@ -105,3 +110,60 @@ def test_reply_without_tool_calls_omits_the_key():
     """空 tool_calls 数组在部分服务端会被判为非法，干脆不带这个键。"""
     msg = Reply(content="你好").to_message()
     assert msg == {"role": "assistant", "content": "你好"}
+
+
+# ---------- LLM.chat 的请求体（离线，无网络） ----------
+
+def _llm_capturing(body_out: dict) -> LLM:
+    """构造一个把请求体写进 body_out 的 LLM。
+
+    用 httpx2.MockTransport 在传输层拦截——不发真实请求，也不需要网络。
+    替换内部客户端是刻意的：为了不动 LLM 的公开接口（v1 不需要客户端注入缝）。
+    """
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body_out["body"] = json.loads(request.content)
+        return httpx2.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "m",
+                "choices": [
+                    {"index": 0, "delta": {"content": "hi"}, "finish_reason": None}
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    config = Config(base_url="https://example.invalid/v1", api_key="sk-x", model="m")
+    llm = LLM(config)
+    llm._client = AsyncOpenAI(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+    return llm
+
+
+def _tools() -> list[dict]:
+    return [{"type": "function", "function": {"name": "t", "description": "d",
+                                              "parameters": {"type": "object"}}}]
+
+
+async def test_chat_omits_tools_key_when_no_tools():
+    """没有工具时请求体里不该有 tools 键——传 None 会变成 "tools": null。"""
+    captured: dict = {}
+    llm = _llm_capturing(captured)
+    async for _ in llm.chat([{"role": "user", "content": "x"}], []):
+        pass
+    assert "tools" not in captured["body"]
+
+
+async def test_chat_sends_tools_key_when_tools_present():
+    captured: dict = {}
+    llm = _llm_capturing(captured)
+    async for _ in llm.chat([{"role": "user", "content": "x"}], _tools()):
+        pass
+    assert captured["body"]["tools"] == _tools()
