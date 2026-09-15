@@ -43,8 +43,15 @@ def openai_schema(tool: Tool) -> dict:
     }
 
 
-def tools_schema() -> list[dict]:
-    return [openai_schema(t) for t in TOOLS.values()]
+def tools_schema(registry: dict[str, Tool] | None = None) -> list[dict]:
+    """生成模型可见的 tool 定义。
+
+    传 registry 时以它为准——注入自定义工具集的调用方必须让模型看到**那一份**，
+    否则模型会被展示它根本调不到的工具。注意用 `is None` 而非真值判断：
+    空注册表是合法输入，不该悄悄回落到全局 TOOLS。
+    """
+    tools = TOOLS if registry is None else registry
+    return [openai_schema(t) for t in tools.values()]
 
 
 def truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:

@@ -87,7 +87,7 @@ class Agent:
         for _ in range(self.max_steps):
             reply = None
             try:
-                async for item in self.llm.chat(self.messages, tools_schema()):
+                async for item in self.llm.chat(self.messages, tools_schema(self.tools)):
                     if isinstance(item, TextDelta):
                         yield item
                     else:

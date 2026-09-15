@@ -155,9 +155,11 @@ class FakeLLM:
     def __init__(self, script):
         self.script = list(script)
         self.seen_messages: list[list[dict]] = []
+        self.seen_tools: list[list[dict]] = []
 
     async def chat(self, messages, tools):
         self.seen_messages.append([dict(m) for m in messages])
+        self.seen_tools.append(list(tools))
         for item in self.script.pop(0):
             yield item
 
@@ -185,6 +187,19 @@ async def test_run_without_tool_calls_finishes():
     assert isinstance(events[-1], Finished)
     assert events[-1].text == "你好"
     assert any(isinstance(e, TextDelta) and e.text == "你好" for e in events)
+
+
+async def test_run_offers_the_injected_registry_to_the_model():
+    """注入的 tools 必须真的进入模型可见的 schema——否则这个接口在骗人。
+
+    没有这条断言，一个只查 self.tools、却把全局 TOOLS 的 schema 递给模型的实现
+    会让全部测试照样通过，而模型被展示了它根本调不到的工具。
+    """
+    agent = scripted([reply("好")], tools=make_tools(Risk.READ))
+    [event async for event in agent.run("hi")]
+
+    offered = {schema["function"]["name"] for schema in agent.llm.seen_tools[0]}
+    assert offered == {"echo", "boom"}
 
 
 async def test_tool_result_is_backfilled_into_messages():
