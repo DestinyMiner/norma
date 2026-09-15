@@ -31,12 +31,16 @@ def setup_logging() -> None:
     )
     # 我们自己的审计日志要 INFO，显式打开，否则会被上面的根级别一并挡掉。
     logging.getLogger("norma.audit").setLevel(logging.INFO)
+    # stdin 也在内：输入被重定向（`echo "帮我整理目录" | norma`）时，Windows 按本地
+    # 代码页（本机 GBK）解码并启用 surrogateescape，中文字节会变成 \udc95 这类代理转义，
+    # 随后在 JSON 编码时炸掉——而且报出来是"模型调用失败"，把人支去找网络和密钥，
+    # 实际病因在本地编码。stdout/stderr 的理由见下。
     # stdout 被重定向（`norma > out.txt`）时，Windows 按本地代码页（本机 GBK）编码，
     # 于是 ✓/✗/⚠ 以及工具输出里任何超出 GBK 的字符（emoji 文件名之类）都会让 print
     # 直接抛 UnicodeEncodeError 把程序打崩。显式改成 UTF-8 并允许替换：
     #   * 交互式终端：Python 本来就用 UTF-8 + WriteConsoleW，这里是空操作
     #   * 重定向：输出为 UTF-8，不再崩，符号也保留
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, OSError, ValueError):

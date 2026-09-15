@@ -190,3 +190,72 @@ def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
         logging.getLogger("norma.audit").setLevel(saved_audit)
+
+
+def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
+    """`echo "帮我整理目录" | norma` 必须真的把中文送到模型，而不是炸在编码上。
+
+    这条**只能**起真子进程：pytest 里 sys.stdin 是 DontReadFromInput，没有
+    reconfigure，任何单元断言都只会走到 except 分支，对真实路径什么也证明不了。
+
+    缺陷形态：stdin 被重定向时 Python 按本地代码页（本机 GBK）+ surrogateescape
+    解码，中文字节变成 \\udc95 这类代理转义，随后在 JSON 编码时抛
+    UnicodeEncodeError——报出来却是"模型调用失败"，把人支去找网络和密钥，
+    而实际上**一个请求都没发出去**。
+
+    用本地 stub 端点（127.0.0.1，不出网、不需要真密钥）接住请求，断言请求真的
+    发出去了，且消息里的中文原样到达。
+    """
+    import http.server
+    import json
+    import os
+    import subprocess
+    import sys
+    import threading
+
+    captured: list[bytes] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            captured.append(self.rfile.read(length))
+            payload = json.dumps({
+                "id": "1", "object": "chat.completion.chunk", "created": 0,
+                "model": "m",
+                "choices": [{"index": 0, "delta": {"content": "好的"},
+                             "finish_reason": None}],
+            })
+            data = f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    env = dict(os.environ)
+    env.pop("PYTHONIOENCODING", None)  # 不许靠这个拐杖蒙混过关
+    env.update({
+        "NORMA_API_KEY": "sk-fake",
+        "NORMA_BASE_URL": f"http://127.0.0.1:{server.server_address[1]}/v1",
+        "NORMA_MODEL": "m",
+    })
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", "from norma.cli import main; main()"],
+            input="列一下当前目录\n\n".encode("utf-8"),
+            capture_output=True, env=env, cwd=tmp_path, timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "surrogates not allowed" not in stderr
+    assert captured, f"一个请求都没发出去：{stderr}"
+    assert json.loads(captured[0])["messages"][-1]["content"] == "列一下当前目录"
