@@ -51,3 +51,86 @@ async def test_read_line_uses_a_daemon_thread(monkeypatch):
 
     assert await _read_line("> ") == "y"
     assert seen["daemon"] is True
+
+
+async def test_read_line_discards_a_late_answer_after_the_loop_is_gone(monkeypatch):
+    """调用方取消后进程继续存活时，迟到的回答应当被静默丢弃。
+
+    没有这层保护，被取消的提示符在工作线程返回时会在事件循环已关闭的
+    loop 上 call_soon_threadsafe，Python 于是打印
+    "RuntimeError: Event loop is closed" 的线程异常栈。
+    """
+    import asyncio
+    import threading as _threading
+
+    released = _threading.Event()
+    entered = _threading.Event()
+
+    def slow_input(prompt: str) -> str:
+        entered.set()
+        released.wait(5)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", slow_input)
+
+    from norma.cli import _read_line
+
+    task = asyncio.ensure_future(_read_line("> "))
+    await asyncio.to_thread(entered.wait, 5)   # 等 worker 真正进入 input()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # 循环仍然活着，但 future 已被取消——worker 稍后返回时必须不抛异常。
+    released.set()
+    await asyncio.sleep(0.3)
+
+    assert task.cancelled()
+
+
+def test_read_line_drops_a_late_answer_after_the_loop_is_closed(monkeypatch):
+    """循环**已关闭**后，被取消的提示符迟到返回时不能在线程里抛异常。
+
+    上一条测试里事件循环仍然活着，_finish 的 done 判断就足以吞掉迟到的回答——
+    也就是说它守不住 deliver 的 try/except。真正会炸的是这条路径：循环已关闭，
+    call_soon_threadsafe 直接抛 RuntimeError，工作线程于是打印线程异常栈。
+    这正是将来远端客户端取消权限询问、而进程继续存活时的形态。
+    """
+    import asyncio
+    import threading as _threading
+    import time
+
+    released = _threading.Event()
+    entered = _threading.Event()
+
+    def slow_input(prompt: str) -> str:
+        entered.set()
+        released.wait(5)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", slow_input)
+
+    unhandled: list = []
+    monkeypatch.setattr(_threading, "excepthook", unhandled.append)
+
+    from norma.cli import _read_line
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(_read_line("> "))
+        loop.run_until_complete(asyncio.sleep(0))  # 让协程把 worker 线程启动起来
+        assert entered.wait(5)                     # worker 确已进入 input()
+        task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
+    finally:
+        loop.close()          # 关闭循环时 worker 仍卡在 input() 里
+
+    released.set()            # worker 现在返回一个无人等待的回答
+    time.sleep(0.3)
+
+    assert unhandled == [], f"工作线程里抛出了未处理异常：{unhandled}"

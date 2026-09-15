@@ -57,17 +57,29 @@ async def _read_line(prompt: str) -> str:
     这是正确的），而不是把它变成一次"拒绝"——后者需要吞掉 CancelledError，
     那会破坏取消语义，不值得。stdin 被关闭（EOF）这类由工作线程自身抛出的异常
     仍会被 ask_in_terminal 转成拒绝。
+
+    被取消后工作线程仍卡在 ``input()`` 里；它**迟到**返回时，等待方早已不存在，
+    这时的回答被静默丢弃，而不是在线程里抛异常（见 ``deliver``）。
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()
+
+    def deliver(value: object) -> None:
+        try:
+            loop.call_soon_threadsafe(_finish, future, value)
+        except RuntimeError:
+            # 事件循环已关闭：没有等待方了，静默丢弃。
+            # 触发场景是"调用方取消了 _read_line 的 await 但进程继续存活"，
+            # 正是将来远端客户端取消权限询问时的形态。
+            pass
 
     def worker() -> None:
         try:
             line = input(prompt)
         except BaseException as exc:  # noqa: BLE001 — 原样转交等待方判定
-            loop.call_soon_threadsafe(_finish, future, exc)
+            deliver(exc)
         else:
-            loop.call_soon_threadsafe(_finish, future, line)
+            deliver(line)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -110,7 +122,7 @@ async def repl(agent: Agent) -> None:
     print(f"norma 已就绪（审计日志：{LOG_PATH}）。直接输入内容开始对话，空行退出。")
     while True:
         try:
-            line = (await asyncio.to_thread(input, "\n你> ")).strip()
+            line = (await _read_line("\n你> ")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
