@@ -6,13 +6,15 @@ ask_permission。因此内核完全可测，无需任何环境准备。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import AsyncIterator
 
 from pydantic import ValidationError
 
 from . import permission
+from .events import Event, Failed, Finished, TextDelta, ToolCallStarted, ToolResult
 from .llm import ToolCall
 from .permission import AskPermission
-from .tools import TOOLS, Tool, audit, truncate
+from .tools import TOOLS, Tool, audit, tools_schema, truncate
 
 DEFAULT_MAX_STEPS = 25
 
@@ -77,3 +79,48 @@ class Agent:
             return ExecResult(False, f"工具报错：{exc}")
 
         return ExecResult(True, truncate(output))
+
+    async def run(self, user_input: str) -> AsyncIterator[Event]:
+        """驱动循环，产出事件流。这是内核唯一的对外入口。"""
+        self.messages.append({"role": "user", "content": user_input})
+
+        for _ in range(self.max_steps):
+            reply = None
+            try:
+                async for item in self.llm.chat(self.messages, tools_schema()):
+                    if isinstance(item, TextDelta):
+                        yield item
+                    else:
+                        reply = item
+            except Exception as exc:  # noqa: BLE001
+                # spec §7 决定 3：API 超时/失败、鉴权失败属于**预期内失败**，
+                # 必须变成 Failed 事件而不是抛穿生成器——否则 CLI 直接吃 traceback，
+                # 客户端也拿不到任何结构化信号。网络中断、密钥错误、畸形 chunk 都走这里。
+                yield Failed(f"模型调用失败：{exc}")
+                return
+
+            if reply is None:
+                yield Failed("模型没有返回任何内容")
+                return
+
+            # 必须回填含 tool_calls 的 assistant 消息，
+            # 否则模型下一轮会重复调用同一工具
+            self.messages.append(reply.to_message())
+
+            if not reply.tool_calls:
+                yield Finished(reply.content)
+                return
+
+            for tool_call in reply.tool_calls:
+                yield ToolCallStarted(
+                    tool_call.id, tool_call.name, tool_call.args)
+                result = await self.execute(tool_call)
+                yield ToolResult(
+                    tool_call.id, tool_call.name, result.ok, result.content)
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result.content,
+                })
+
+        yield Failed(f"超过最大步数 {self.max_steps}")

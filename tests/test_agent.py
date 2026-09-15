@@ -1,10 +1,10 @@
 import logging
 
-import pytest
 from pydantic import BaseModel, Field
 
 from norma.agent import Agent, ExecResult
-from norma.llm import ToolCall
+from norma.events import Failed, Finished, TextDelta, ToolCallStarted, ToolResult
+from norma.llm import Reply, ToolCall
 from norma.tools import Risk, Tool
 
 
@@ -147,3 +147,199 @@ async def test_execute_audits_every_outcome(caplog):
             ToolCall("c3", "echo", {}))
 
     assert caplog.text.count("tool=") == 3
+
+
+class FakeLLM:
+    """照剧本走的假 LLM。script 里每个元素是某一轮的输出序列。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.seen_messages: list[list[dict]] = []
+
+    async def chat(self, messages, tools):
+        self.seen_messages.append([dict(m) for m in messages])
+        for item in self.script.pop(0):
+            yield item
+
+
+def reply(text="", calls=()) -> list:
+    items = [TextDelta(text)] if text else []
+    items.append(Reply(content=text, tool_calls=list(calls)))
+    return items
+
+
+def call(call_id="c1", name="echo", args=None, args_error=""):
+    return ToolCall(id=call_id, name=name, args=args or {}, args_error=args_error)
+
+
+def scripted(script, tools=None, ask=allow, max_steps=25) -> Agent:
+    agent = Agent(llm=FakeLLM(script), tools=tools or make_tools(),
+                  ask_permission=ask, max_steps=max_steps)
+    return agent
+
+
+async def test_run_without_tool_calls_finishes():
+    agent = scripted([reply("你好")])
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert events[-1].text == "你好"
+    assert any(isinstance(e, TextDelta) and e.text == "你好" for e in events)
+
+
+async def test_tool_result_is_backfilled_into_messages():
+    agent = scripted([
+        reply("", [call(name="echo", args={"text": "abc"})]),
+        reply("完成"),
+    ])
+
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert [m["role"] for m in agent.messages] == ["user", "assistant", "tool", "assistant"]
+    tool_msg = agent.messages[2]
+    assert tool_msg["tool_call_id"] == "c1"
+    assert tool_msg["content"] == "echo:abc"
+
+
+async def test_assistant_message_is_appended_before_tool_result():
+    """不追加含 tool_calls 的 assistant 消息，模型下一轮会重复调用同一工具。"""
+    agent = scripted([
+        reply("", [call()]),
+        reply("完成"),
+    ])
+    [e async for e in agent.run("hi")]
+
+    assistant = agent.messages[1]
+    assert assistant["role"] == "assistant"
+    assert assistant["tool_calls"][0]["function"]["name"] == "echo"
+
+
+async def test_tool_call_started_and_result_are_paired():
+    agent = scripted([
+        reply("", [call("c1"), call("c2")]),
+        reply("完成"),
+    ])
+    events = [e async for e in agent.run("hi")]
+
+    started = [e.call_id for e in events if isinstance(e, ToolCallStarted)]
+    results = [e.call_id for e in events if isinstance(e, ToolResult)]
+    assert started == ["c1", "c2"]
+    assert results == started
+
+
+async def test_failed_tool_call_still_gets_a_paired_result():
+    agent = scripted([reply("", [call(name="nope")]), reply("好吧")])
+    events = [e async for e in agent.run("hi")]
+
+    started = [e for e in events if isinstance(e, ToolCallStarted)]
+    results = [e for e in events if isinstance(e, ToolResult)]
+    assert len(started) == len(results) == 1
+    assert results[0].ok is False
+
+
+async def test_unknown_tool_is_backfilled_and_loop_continues():
+    agent = scripted([reply("", [call(name="move_file")]), reply("改用别的办法")])
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert "没有名为 move_file 的工具" in agent.messages[2]["content"]
+
+
+async def test_malformed_args_json_is_backfilled():
+    agent = scripted([
+        reply("", [call(args_error="arguments 不是合法 JSON")]),
+        reply("重试"),
+    ])
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert "参数错误" in agent.messages[2]["content"]
+
+
+async def test_invalid_params_are_backfilled():
+    agent = scripted([
+        reply("", [call(args={"text": 123})]),
+        reply("重试"),
+    ])
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert "参数错误" in agent.messages[2]["content"]
+
+
+async def test_permission_denial_is_backfilled():
+    agent = scripted(
+        [reply("", [call(args={"text": "x"})]), reply("那算了")],
+        tools=make_tools(Risk.WRITE),
+        ask=deny,
+    )
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert agent.messages[2]["content"] == "用户拒绝了这次操作"
+
+
+async def test_read_tool_does_not_trigger_permission_prompt():
+    asked = []
+
+    async def ask(tool: Tool, args: dict) -> bool:
+        asked.append(tool.name)
+        return True
+
+    agent = scripted([reply("", [call()]), reply("完成")],
+                     tools=make_tools(Risk.READ), ask=ask)
+    [e async for e in agent.run("hi")]
+
+    assert asked == []
+
+
+async def test_multiple_rounds_of_tool_calls():
+    agent = scripted([
+        reply("", [call("c1", args={"text": "一"})]),
+        reply("", [call("c2", args={"text": "二"})]),
+        reply("都做完了"),
+    ])
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Finished)
+    assert [m["role"] for m in agent.messages] == [
+        "user", "assistant", "tool", "assistant", "tool", "assistant"]
+
+
+async def test_exceeding_max_steps_yields_failed():
+    # 每轮都调工具，永远不结束
+    agent = scripted([reply("", [call(f"c{i}")]) for i in range(10)], max_steps=3)
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Failed)
+    assert "最大步数 3" in events[-1].reason
+
+
+async def test_llm_failure_yields_failed():
+    """spec §7 决定 3：API 失败是预期内失败，必须变成 Failed 事件而不是抛穿。"""
+
+    class ExplodingLLM:
+        async def chat(self, messages, tools):
+            raise ConnectionError("连不上")
+            yield  # 让这个方法成为异步生成器
+
+    agent = Agent(
+        llm=ExplodingLLM(),
+        ask_permission=allow,
+        tools=make_tools(),
+        max_steps=3,
+    )
+    events = [event async for event in agent.run("hi")]
+
+    assert isinstance(events[-1], Failed)
+    assert "模型调用失败" in events[-1].reason
+    assert "连不上" in events[-1].reason
+
+
+async def test_finished_text_is_not_duplicated_into_messages_twice():
+    agent = scripted([reply("答案")])
+    [e async for e in agent.run("hi")]
+
+    assert [m["role"] for m in agent.messages] == ["user", "assistant"]
+    assert agent.messages[1]["content"] == "答案"
