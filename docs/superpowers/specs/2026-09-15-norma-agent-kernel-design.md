@@ -61,7 +61,7 @@ v1 中 CLI 进程恰好等于内核进程，很容易顺手把状态写进 CLI�
 - 权限闸门（缝留好，策略最简）
 - CLI 客户端（交互式 REPL）
 - 审计日志
-- 9 条自动化测试 + 1 次真机冒烟
+- 自动化测试（见 §13）+ 1 次真机冒烟
 
 ### v1 不做（刻意推迟）
 
@@ -126,6 +126,11 @@ norma/
 │       ├── agent.py
 │       └── cli.py
 └── tests/
+    ├── test_events.py
+    ├── test_config.py
+    ├── test_llm.py
+    ├── test_tools.py
+    ├── test_permission.py
     └── test_agent.py
 ```
 
@@ -275,7 +280,7 @@ def openai_schema(t: Tool) -> dict:
 
 ## 9. 执行路径（本设计的核心）
 
-每次工具调用依次过四关。**四条失败路径全部变成结果回填，没有一条会中断循环**：
+每次工具调用依次过六步。**每一条失败路径都变成结果回填，没有一条会中断循环**：
 
 ```python
 @dataclass
@@ -283,38 +288,52 @@ class ExecResult:          # 内部类型，不是协议类型——勿与协议
     ok: bool
     content: str
 
-async def execute(name, args, ask) -> ExecResult:
-    result = await _run(name, args, ask)
-    audit(name, args, result)                             # 每个调用都记一行，含失败与拒绝
+async def execute(self, call: ToolCall) -> ExecResult:
+    result = await self._run(call)
+    audit(call.name, call.args, result.ok, result.content)   # 每个调用都记一行，含失败与拒绝
     return result
 
-async def _run(name, args, ask) -> ExecResult:
-    tool = TOOLS.get(name)                                # ⓪ 工具存在性
+async def _run(self, call: ToolCall) -> ExecResult:
+    tool = self.tools.get(call.name)                      # ⓪ 工具存在性
     if tool is None:
-        return ExecResult(False, f"没有名为 {name} 的工具")
+        return ExecResult(False, f"没有名为 {call.name} 的工具")
 
-    denied = await permission.check(tool, args, ask)      # ① 权限
+    if call.args_error:                                   # ① arguments 是否合法 JSON
+        return ExecResult(False, f"参数错误：{call.args_error}")
+
+    try:                                                  # ② 权限
+        denied = await permission.check(tool, call.args, self.ask_permission)
+    except Exception as exc:
+        denied = f"权限检查失败，已按拒绝处理：{exc}"
     if denied:
         return ExecResult(False, denied)                  #    "用户拒绝了这次操作"
 
     try:
-        validated = tool.params(**args)                   # ② 参数校验
+        validated = tool.params(**call.args)              # ③ 参数校验
     except ValidationError as e:
         return ExecResult(False, f"参数错误：{e}")
 
     try:
-        out = await tool.fn(**validated.model_dump())     # ③ 执行
+        out = await tool.fn(**validated.model_dump())     # ④ 执行
     except Exception as e:
         return ExecResult(False, f"工具报错：{e}")
 
-    return ExecResult(True, truncate(out, 8000))          # ④ 截断
+    return ExecResult(True, truncate(out))                # ⑤ 截断
 ```
 
 **⓪ 不是凑数的。** 模型会幻觉出不存在的工具名——它会调用 `move_file`、`search_web` 这类它认为「应该有」的工具。若不拦截，`TOOLS[name]` 直接 `KeyError` 崩掉整个 run。必须把它当成常规路径而非异常。
 
+**① 同样不是凑数的。** 流式响应被 `max_tokens` 截断时，`arguments` 会断在半截，`json.loads` 必然失败。仅靠 ③ 的 pydantic 校验看似能挡住——**但只对必填参数的工具成立**。一个参数全可选的工具会带着空 `{}` 静默执行，这是会造成错误执行的风险，不能依赖「我们的工具恰好都有必填参数」这种巧合。因此参数在 `llm.py` 解析失败时记录 `ToolCall.args_error`，在这里率先拦截。
+
+顺序说明：① 在 ② 之前，因为参数都不成立时没有询问用户的必要——不该让用户去批准一次注定失败的调用。
+
+**② 自身也要兜住，且默认拒绝。** 权限检查本身可能失败：远端 `ask` 的网络错误、CLI 在询问时读到 `EOFError`。这类失败若直接抛出会毁掉整个 run，而默认放行更危险。因此按 **fail-closed** 处理——检查失败一律视为拒绝，理由回填给模型。
+
+`ask_permission` 是构造 `Agent` 的**必填参数**，不给默认值。缺参数应当在你写代码时立刻报错，而不是等到第一次写文件时才炸。
+
 **`ExecResult` 与协议事件 `ToolResult` 是两个东西**：前者是执行层内部产物，后者是发给客户端的播报（含 `call_id`、`name`）。执行层不该知道事件的存在，`agent.run` 负责把前者包装成后者。
 
-`execute` 包一层 `_run` 是为了保证**审计一定落盘**——四条返回路径都要记日志，散在四个 `return` 前迟早漏一个。
+`execute` 包一层 `_run` 是为了保证**审计一定落盘**——每条返回路径都要记日志，散在各个 `return` 前迟早漏一个。
 
 模块归属：`execute` 是 `Agent` 的方法（`agent.py`）；`audit` 与 `truncate` 是 `tools.py` 里的辅助函数。
 
@@ -384,7 +403,7 @@ async def run(self, user_input: str) -> AsyncIterator[Event]:
 
         for call in reply.tool_calls:
             yield ToolCallStarted(call.id, call.name, call.args)
-            result = await self.execute(call.name, call.args)
+            result = await self.execute(call)
             yield ToolResult(call.id, call.name, result.ok, result.content)
             self.messages.append({                 # tool 结果回填
                 "role": "tool",
@@ -399,7 +418,7 @@ async def run(self, user_input: str) -> AsyncIterator[Event]:
 
 - `max_steps` 计的是**模型回合数**，不是工具调用数。默认 25。
 - 每轮必须把 assistant 消息（含 `tool_calls`）追加进 `messages`，否则模型下一轮会重复调用同一工具。
-- 四条已知失败路径（工具不存在、权限拒绝、参数非法、工具报错）均在 `execute` 内转为结果回填，不中断循环（见 §9）。
+- 六条已知失败路径（工具不存在、arguments 非法 JSON、权限拒绝、权限检查失败、参数校验失败、工具报错）均在 `execute` 内转为结果回填，不中断循环（见 §9）。
 - 每个 `ToolCallStarted` 必定配对一条 `ToolResult`（见 §7 决定 2）。
 - **多工具串行执行**。OpenAI 兼容接口可以一次返回多个 `tool_calls`，v1 串行处理：顺序确定，权限询问不会同时弹两个。这是一处刻意简化：
 
@@ -417,7 +436,8 @@ async def run(self, user_input: str) -> AsyncIterator[Event]:
 class ToolCall:
     id: str
     name: str
-    args: dict          # 已解析的 dict
+    args: dict          # 已解析的 dict；解析失败时为空 dict
+    args_error: str = ""    # 非空 = arguments 不是合法 JSON（见 §9 的 ①）
 
 @dataclass
 class Reply:
@@ -446,7 +466,18 @@ class Reply:
 
 ## 13. 测试策略
 
-接缝在 `llm.py`——它是唯一碰网络的地方。测试注入照剧本走的假 LLM：
+测试按模块分文件。接缝在 `llm.py`——它是唯一碰网络的地方。
+
+| 文件 | 覆盖 |
+|---|---|
+| `test_events.py` | 5 种事件的 `to_dict()` 结构；全部可 `json.dumps`（防 `Path` 之类非原生类型混入） |
+| `test_config.py` | 缺 `NORMA_API_KEY` 时报错清晰；默认值正确 |
+| `test_llm.py` | **tool_call 增量拼接**（见下，全套重点） |
+| `test_tools.py` | 各工具行为（`tmp_path`）；截断；超时杀进程；中文输出编码 |
+| `test_permission.py` | read 不问；write/exec 询问后被允许 / 被拒绝 |
+| `test_agent.py` | 循环的 11 种情形（见下） |
+
+`test_agent.py` 用照剧本走的假 LLM——它是唯一的注入点：
 
 ```python
 class FakeLLM:
@@ -456,21 +487,30 @@ class FakeLLM:
             yield item
 ```
 
-`tests/test_agent.py`：
-
 | # | 验证 |
 |---|---|
 | 1 | 模型不调工具 → `Finished` |
-| 2 | 调一次工具 → 结果真的回填进了 `messages` → `Finished` |
+| 2 | 调一次工具 → 结果真的回填进 `messages` → `Finished` |
 | 3 | 工具抛异常 → 错误回填 → 模型恢复 |
 | 4 | 权限被拒 → 拒绝理由回填 → 模型改道 |
 | 5 | 参数不合法 → 校验错误回填（**不崩**） |
-| 6 | 超过 `max_steps` → `Failed` |
-| 7 | 五种事件都能 `json.dumps` |
-| 8 | **tool_call 增量拼接**：喂手工构造的碎片序列，验证按 index 累积 |
-| 9 | 模型调用不存在的工具名 → 错误回填 → 模型改道（**不崩**，见 §9 的 ⓪） |
+| 6 | 工具名不存在 → 错误回填（**不崩**，§9 的 ⓪） |
+| 7 | `arguments` 非法 JSON → 错误回填（**不崩**，§9 的 ①） |
+| 8 | 超过 `max_steps` → `Failed` |
+| 9 | **`ToolCallStarted` 与 `ToolResult` 严格配对**（§7 决定 2 的不变式） |
+| 10 | read 类工具不触发权限询问 |
+| 11 | 权限检查自身抛错 → **fail-closed**，按拒绝回填（**不崩**） |
 
-**第 8 条是全套中最重要的。** 理由见 §11。
+### `test_llm.py`：全套最重要的一组
+
+理由见 §11。必须覆盖：
+
+- 纯文本流 → 若干 `TextDelta` + 一个无 tool_call 的 `Reply`
+- 单个工具调用，`arguments` 在**多个 chunk 里分片**到达
+- 两个工具调用按 `index` **交错**到达
+- 首个 chunk 之后 `id` / `function.name` 为 `None`（真实 API 行为；写成赋值而非累加会把已取到的工具名清空）
+- `arguments` 被截断成非法 JSON → `args_error` 非空
+- 空 `choices` 的收尾 chunk（带 usage）被安全忽略
 
 ### 手工冒烟
 
