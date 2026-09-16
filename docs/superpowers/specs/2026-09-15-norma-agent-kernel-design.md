@@ -544,6 +544,16 @@ class FakeLLM:
 | 权限策略硬编码在 `permission.py` | 改策略要改代码 | 规则文件 / 远端确认 |
 | 无上下文压缩 | 长会话会触窗口上限 | 历史摘要 + 保留最近 N 轮 |
 
+实现与审查阶段暴露出的天花板，一并记录（都不是缺陷，是**已知边界**）：
+
+| 取舍 | 代价 | 升级路径 |
+|---|---|---|
+| `run_powershell` 超时只杀**直接**子进程 | 模型若派生脱离的孙进程（`Start-Process`、`cmd /c start`）且撞上超时，该进程会存活。日常的 `Get-ChildItem`/`Copy-Item`/`Invoke-WebRequest` 都是进程内 cmdlet，随父进程一起死 | 用 ctypes 加 Win32 Job Object（`CreateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `AssignProcessToJobObject`），约 40 行平台专有代码；或限制该工具不派生脱离进程 |
+| `POLICY[tool.risk]` 是裸下标 | 未来新增 `Risk` 成员而未同步补 POLICY 表，会在**该工具被用到时**抛 `KeyError`。方向是 fail-closed（永不误放行），且 §9 的 ② 守卫会把它转成「权限检查失败，已按拒绝处理」，循环不死 | 加一条不变量测试 `assert set(POLICY) == set(Risk)`，把运行期失败提前成改完立刻测试红；或改 `POLICY.get(tool.risk, True)` 让默认变为「询问」（仍 fail-closed，但给出中文理由而非 KeyError 文本） |
+| `_child_env()` 只剔除 `NORMA_` 前缀 | 接入第二家 provider 时，它的密钥（如 `OPENAI_API_KEY`）仍会被每个子进程继承，而 §9 的 I3 修复正是为了堵这条泄露路径 | 改为白名单（只保留 PATH/SystemRoot/TEMP 等必需项），或按 provider 前缀扩展剔除列表 |
+| `write_file` 非原子覆盖 | `write_text` 先截断再写；写入中途失败（磁盘满、ACL 变更、掉电）会两个版本都没了 | 写同目录临时文件，再 `os.replace`（Windows 上同样是原子的） |
+| Windows 上 `\n` 被静默改写成 `\r\n` | text 模式默认 `newline=None`，故 write→read 往返非恒等；生成的 `.sh` 在 git-bash 下会坏。对 `.txt` 而言 CRLF 可能本就正确 | `write_text(..., newline="")` 若需要字节保真 |
+
 ## 15. 环境前提
 
 **本机当前未安装 Python。**
