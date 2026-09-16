@@ -244,6 +244,12 @@ def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
         "NORMA_API_KEY": "sk-fake",
         "NORMA_BASE_URL": f"http://127.0.0.1:{server.server_address[1]}/v1",
         "NORMA_MODEL": "m",
+        # 必须显式绕过系统代理：httpx2 会读 Windows 的 ProxyServer（Clash 之类常驻），
+        # 但**不认** ProxyOverride 里的那条 `127.*`，于是发往本地 stub 的请求被塞给
+        # 系统代理、换来一个 502。不写这两行，这条测试就会随"用户是否开着系统代理"
+        # 时红时绿——而那不是被测代码的问题。
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
     })
 
     try:

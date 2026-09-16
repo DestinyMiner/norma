@@ -553,6 +553,7 @@ class FakeLLM:
 | `_child_env()` 只剔除 `NORMA_` 前缀 | 接入第二家 provider 时，它的密钥（如 `OPENAI_API_KEY`）仍会被每个子进程继承，而 §9 的 I3 修复正是为了堵这条泄露路径 | 改为白名单（只保留 PATH/SystemRoot/TEMP 等必需项），或按 provider 前缀扩展剔除列表 |
 | `write_file` 非原子覆盖 | `write_text` 先截断再写；写入中途失败（磁盘满、ACL 变更、掉电）会两个版本都没了 | 写同目录临时文件，再 `os.replace`（Windows 上同样是原子的） |
 | Windows 上 `\n` 被静默改写成 `\r\n` | text 模式默认 `newline=None`，故 write→read 往返非恒等；生成的 `.sh` 在 git-bash 下会坏。对 `.txt` 而言 CRLF 可能本就正确 | `write_text(..., newline="")` 若需要字节保真 |
+| 系统代理会拦截指向 **localhost** 的请求 | `httpx2` 读 Windows 的 `ProxyServer`（Clash 等常驻）却**不认** `ProxyOverride` 里的 `127.*` 绕过规则，于是本地请求被塞给代理、换来 502（而非连接被拒，所以错误离病因很远）。今天不影响 `api.deepseek.com`；**一旦把 `NORMA_BASE_URL` 指向本地模型（Ollama 之类）就会踩到** | 给 `LLM` 加可配置的 `http_client`，或在 `base_url` 落在 localhost 时自动绕过代理。测试侧已显式设 `NO_PROXY` 隔离（见 `tests/test_cli.py`） |
 
 ## 15. 环境前提
 
