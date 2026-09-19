@@ -101,7 +101,10 @@ class ReadFileParams(BaseModel):
     path: str = Field(..., description="要读取的文件路径")
     offset: int = Field(
         0, ge=0,
-        description="从第几个字符开始读（0 起算）。接着上次读到的地方继续，就把它设成已读字符数",
+        # 措辞与 prompt、工具描述**逐字一致**（都是「已读的字符数」）：同一个模型会在
+        # 三个地方读到这句话，而它要拿这个数去算下一个 offset——多一个字少一个字都可能
+        # 被读成另一个意思（"已读字符数" vs "上次读到的字符数"就是一次真实翻车）。
+        description="从第几个字符开始读（0 起算）。接着上次读到的地方继续，就把它设成已读的字符数",
     )
     limit: int = Field(
         MAX_RESULT_CHARS, ge=1,

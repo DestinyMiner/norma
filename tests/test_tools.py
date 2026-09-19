@@ -143,8 +143,10 @@ def test_the_prompt_and_the_description_teach_the_same_paging():
         assert "上次读到的字符数" not in text, f"{where} 用了页宽语义（会无限重读第二页）"
         assert "本次读到的字符数" not in text, f"{where} 用了页宽语义（会无限重读第二页）"
 
-    # 参数本身的说明（模型每轮同样读得到）必须与上面一致：按字符、不按字节
+    # 参数本身的说明（模型每轮同样读得到）必须与上面**逐字**一致：
+    # 按字符、不按字节，而且教的那个数就是"已读的字符数"
     offset_field = TOOLS["read_file"].params.model_fields["offset"]
+    assert "已读的字符数" in offset_field.description
     assert "字符" in offset_field.description
     assert "字节" not in offset_field.description
 
