@@ -487,12 +487,15 @@ def test_the_page_budget_reserves_the_longest_possible_marker():
     assert MAX_RESULT_CHARS - len(longest) - 1 > MAX_RESULT_CHARS - 100
 
 
-async def test_the_emitted_page_fills_the_ceiling_exactly(tmp_path):
-    """一页必须**正好**用满 8000；被收尾截断啃掉一个字符就算坏。
+async def test_a_full_page_uses_the_ceiling_without_shortchanging_the_body(tmp_path):
+    """一页要把额度用足、且**声明多少就给多少**。
 
-    判据不能是"没超上限"——截断保证了它。真正的坏法是预算估短了、正文多给几个字符、
+    判据不能是"没超上限"——截断能保证它。真正的坏法是预算估短了、正文多给几个字符、
     然后被 `result[:MAX_RESULT_CHARS]` 悄悄截掉尾巴：**没有任何报错，只是页比它自己
     声明的短**，而模型拿这个 N 算下一个 offset 就会漏读字符。
+
+    留一点余量是对的（估算按最长的那版标记算，宁可少给几个字符也不能声明过头），
+    所以这里只要求"用掉绝大部分额度"，不要求正好 8000。
     """
     text = "字" * 20000                       # 60000 字节，未到 64 KiB 墙
     f = tmp_path / "novel.txt"
@@ -502,10 +505,41 @@ async def test_the_emitted_page_fills_the_ceiling_exactly(tmp_path):
     marker, chunk = out.split("\n", 1)
     declared = int(marker.split("-")[1].split(" ")[0])
 
-    assert len(out) == MAX_RESULT_CHARS       # 正好用满（不是"不超过"）
+    assert len(out) <= MAX_RESULT_CHARS       # 不许超
+    assert len(out) > MAX_RESULT_CHARS - 50   # 也不许浪费一大截额度
     assert len(chunk) == declared             # 声明到哪就真到哪
     assert chunk == text[:declared]
     assert "后面还有" in marker                # 这一页确实不是最后一页
+
+
+@pytest.mark.parametrize("offset", list(range(2025, 2045)) + [2060, 2061, 2062, 2063, 2064, 2065])
+async def test_a_page_ending_on_a_decimal_carry_still_fits(tmp_path, offset):
+    """**回归测试**：正文变长可能让标记**多一位数**（9999 → 10000），额度得算进去。
+
+    实测过的那一档（`offset=2034`、12035 字符的纯文本、`limit=8000`）：第二趟按第一趟
+    的标记长度把正文补满，补完终点从 9999 变成 10000——**标记自己长了一位**，总长 8001，
+    于是断言把一次正常的读取炸成"工具报错"（模型拿到的是内部诊断，不是那一页）。
+    `python -O` 下断言被剥掉时更糟：截断削掉一个字符，页**声明的比给的多**，
+    模型照它算下一个 offset 就漏读——正是这个版本要消灭的那类毛病。
+
+    扫一串贴着进位点的 offset，因为坏窗口只有一个位置宽，单点测试守不住。
+    """
+    from norma.tools import _READ_CAP_BYTES
+
+    for label, text in (("纯文本", "a" * 12035),
+                        ("汉字", "字" * 12035),
+                        ("超上限", "a" * (_READ_CAP_BYTES + 30000))):
+        f = tmp_path / f"carry-{label}.txt"
+        f.write_bytes(text.encode("utf-8"))
+
+        out = await TOOLS["read_file"].fn(path=str(f), offset=offset)
+        assert "工具报错" not in out, f"{label} offset={offset}"
+        marker, chunk = out.split("\n", 1)
+        lo, hi = (int(x) for x in marker.split("第 ")[1].split(" 字符")[0].split("-"))
+
+        assert len(out) <= MAX_RESULT_CHARS, f"{label} offset={offset}: {len(out)}"
+        assert len(chunk) == hi - lo + 1, f"{label} offset={offset} 标记说谎"
+        assert chunk == text[lo - 1:hi], f"{label} offset={offset} 内容不符"
 
 
 @pytest.mark.parametrize("limit", [7968, 7969, 7970, 7971, 7972, 7973, 7990, 8000])

@@ -724,7 +724,8 @@ def test_default_system_prompt_covers_the_observed_defects():
     assert "read_file" in prompt       # ② 用对的工具，别拿 exec 去读文件
     assert "run_powershell" in prompt
     assert "8000" in prompt            # ③ 读取上限是硬事实，别再试参数
-    assert "共 N 字符" in prompt        #    标记里的总数就是文件长度（别让它不信这个数）
+    assert "共 N 字符" in prompt        #    标记里那个数是什么（可读的那段，不是整个文件）
+    assert "这一次能读到的全部" in prompt  #    措辞必须准确：超上限时它不是文件长度
     assert "64 KiB" in prompt          #    超上限时标记会另报字节数
     assert "offset" in prompt          # ④ 怎么翻页（v1.1.0 的能力，得让它知道）
     assert "不要重复读同一段" in prompt

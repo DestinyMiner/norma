@@ -238,19 +238,21 @@ async def _read_file(
     #   * 从 limit 里扣的话，`limit=5` 会被标记吃光、返回空内容——模型要 5 个字就给它 5 个字；
     #   * 但总额度必须守住 MAX_RESULT_CHARS，因为 `Agent` 那层 `truncate()` 只保留这么多字符。
     #
-    # 估算必须覆盖**最长**的那版标记，包括尾注：`shown=total` 那一版**带不上**尾注
-    # （`offset + shown < total` 不成立），所以它不是最长的。漏掉这 5 个字符的后果
-    # 实测过一次——正文多给几个字符 → 总数超 8000 → 被下面那行 `[:MAX_RESULT_CHARS]`
-    # 悄悄截掉尾巴 → **页比它自己声明的短**，而模型正是拿那个声明算下一个 offset，
-    # 于是漏读字符（`limit=7970/7972` 那一档能稳定复现）。所以显式把尾注加进估算。
-    longest = _page_marker(offset, total, total, note) + _PAGE_TAIL
+    # **一次算准，别分两趟。** 这里踩过两次，都是"估算没覆盖实际那版标记"：
+    #   1. 漏掉尾注（`shown=total` 那版带不上尾注，短 5 个字符）→ 正文多给 → 收尾截断
+    #      把尾巴削掉 → 页比它自己声明的短，模型照它算下一个 offset 就漏读；
+    #   2. 第二趟按**第一趟**的标记长度补满正文，而正文一变长，标记自己的**位数**也可能
+    #      多一位（9999 → 10000）→ 总长 8001 → 断言炸成"工具报错"（实测 offset=2034）。
+    #
+    # 所以额度按**最长可能的那版标记**估一次：正文最多 `limit` 那么多、也最多剩下那么多，
+    # 取两者较小的那个去量标记；`_PAGE_TAIL` 无条件加上（它不出现时标记只会更短）。
+    max_shown = min(limit, total - offset)
+    longest = _page_marker(offset, max_shown, total, note) + _PAGE_TAIL
     budget = max(1, MAX_RESULT_CHARS - len(longest) - 1)          # -1 是标记后那个换行
-    chunk = text[offset:offset + min(limit, budget)]
-    if len(chunk) < limit:                                        # 还有额度就补满
-        room = MAX_RESULT_CHARS - len(_page_marker(offset, len(chunk), total, note)) - 1
-        chunk = text[offset:offset + min(limit, max(1, room))]
+    shown = max(1, min(limit, budget, max_shown))
+    chunk = text[offset:offset + shown]
     result = f"{_page_marker(offset, len(chunk), total, note)}\n{chunk}"
-    # 估算覆盖了最长标记之后这里**进不来**；留着当断言用，真进来就是估算漏了一档。
+    # 上面那次估算已覆盖最长标记；这里进不来，真进来就是又漏了一档（别再改成两趟）。
     assert len(result) <= MAX_RESULT_CHARS, (
         f"页标记+正文超过上限（{len(result)}），估算漏了一档：{result[:80]!r}")
     return result
