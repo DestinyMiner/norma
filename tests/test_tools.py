@@ -483,6 +483,31 @@ def test_the_page_budget_reserves_the_longest_possible_marker():
     # 正文额度＝上限 − 估的标记 − 换行，仍然是个像样的正文长度（标记没有膨胀到吃掉正文）
     assert MAX_RESULT_CHARS - len(longest) - 1 > MAX_RESULT_CHARS - 100
 
+
+async def test_the_emitted_page_fills_the_ceiling_exactly(tmp_path):
+    """一页必须**正好**用满 8000；被收尾截断啃掉一个字符就算坏。
+
+    这条是被一个存活变异逼出来的：把预算那一步的"最长标记"改成用**短**标记估，
+    154 条测试全绿。为什么会绿——预算估短了，正文就多给了几个字符，总数超出 8000，
+    然后被 `result[:MAX_RESULT_CHARS]` 悄悄截掉尾巴：
+    **没有任何报错，只是页比它自己声明的短了一点点**（标记说"到第 N 字符"，实际只到 N-1）。
+    模型拿这个 N 算下一个 offset 就会漏读字符。
+
+    所以判据不能是"没超上限"（截断保证了它），而得是"用满了上限、且与声明一致"。
+    """
+    text = "字" * 20000                       # 60000 字节，未到 64 KiB 墙
+    f = tmp_path / "novel.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    out = await TOOLS["read_file"].fn(path=str(f), limit=MAX_RESULT_CHARS)
+    marker, chunk = out.split("\n", 1)
+    declared = int(marker.split("-")[1].split(" ")[0])
+
+    assert len(out) == MAX_RESULT_CHARS       # 正好用满（不是"不超过"）
+    assert len(chunk) == declared             # 声明到哪就真到哪
+    assert chunk == text[:declared]
+    assert "后面还有" in marker                # 这一页确实不是最后一页
+
     # 回到真实尺度再验一遍真产物：70000 字节的文件必须正好卡在上限内
     # （见 test_limit_cannot_exceed_the_hard_result_ceiling，那条跑的是真的读文件）
 
