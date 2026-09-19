@@ -156,12 +156,13 @@ def test_third_party_info_does_not_pollute_the_audit_log(tmp_path, monkeypatch):
 def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
     """上一条测试在 pytest 里会"因为错误的理由通过"——这条守的才是真正的行为。
 
-    pytest 自己会往根上挂 handler（实测 4 个），根 logger 的默认级别又本来就是
-    WARNING。两者叠加的结果是：把 level 改回 INFO，上一条测试仍然全绿——
-    它测的是 Python 的默认值，不是我们的配置。
+    它守的是**整行配置被删掉**这种坏法：把 root 的 WARNING 拿掉，上一条测试照样全绿
+    （Python 根 logger 的默认级别就是 WARNING，那正是它的断言），只有这条会红。
+    （它**不**负责区分 WARNING 与 INFO——那把两个级别搞混时，上一条自己就会红。）
 
-    这里把根 handler 暂时摘掉，让配置真正生效，也就是真实 CLI 进程里的情形
-    （那里根上没有任何 handler）。用完在 finally 里原样恢复。
+    pytest 自己会往根上挂 handler（实测 4 个：_LiveLoggingNullHandler、_FileHandler、
+    两个 LogCaptureHandler），这里把它们暂时摘掉再验，就是真实 CLI 进程里的情形。
+    用完在 finally 里原样恢复。
     """
     import logging
 
@@ -191,6 +192,23 @@ def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
         logging.getLogger("norma.audit").setLevel(saved_audit)
 
 
+def drop_file_handlers() -> None:
+    """把本测试装上的 FileHandler 摘掉并关闭。
+
+    两件事都得做：不摘，后面的用例会共享一个指向已删除 tmp_path 的 handler；
+    不关，Windows 上文件句柄会让 tmp_path 删不干净。
+    `setup_logging()` 刻意不做重复调用防护（YAGNI，真实入口只调一次），
+    所以这个收尾责任在测试这边。
+    """
+    import logging
+
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            root.removeHandler(handler)
+            handler.close()
+
+
 def test_audit_log_does_not_land_in_the_working_directory(tmp_path, monkeypatch):
     """**回归测试**：日志写在 CWD 时会出现在 `list_dir` 结果里，被模型当内容读。
 
@@ -208,15 +226,18 @@ def test_audit_log_does_not_land_in_the_working_directory(tmp_path, monkeypatch)
     monkeypatch.chdir(workdir)
     monkeypatch.setenv("NORMA_LOG_PATH", str(log_file))
 
-    assert cli.setup_logging() == log_file        # 父目录不存在也要自己建出来
-    logging.getLogger("norma.audit").info("tool=list_dir ok=True")
+    try:
+        assert cli.setup_logging() == log_file    # 父目录不存在也要自己建出来
+        logging.getLogger("norma.audit").info("tool=list_dir ok=True")
 
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+        for handler in logging.getLogger().handlers:
+            handler.flush()
 
-    assert log_file.exists()
-    assert "tool=list_dir ok=True" in log_file.read_text(encoding="utf-8")
-    assert list(workdir.iterdir()) == []          # 工作目录干干净净
+        assert log_file.exists()
+        assert "tool=list_dir ok=True" in log_file.read_text(encoding="utf-8")
+        assert list(workdir.iterdir()) == []      # 工作目录干干净净
+    finally:
+        drop_file_handlers()
 
 
 def test_default_log_path_is_outside_the_working_directory(monkeypatch):
@@ -232,6 +253,26 @@ def test_default_log_path_is_outside_the_working_directory(monkeypatch):
     assert path.is_absolute()
     assert path.parent.name == ".norma"
     assert path.name == "audit.log"
+
+
+def test_log_path_override_cannot_smuggle_the_log_back_into_the_cwd(
+        tmp_path, monkeypatch):
+    """逃生舱自己也不能把日志写回工作目录。
+
+    实测过两种写法都会**重演**这次要修的 bug：`rel/audit.log` 会按 CWD 落盘；
+    `~/x/audit.log` 更糟——会在工作目录里建一个名字就叫 `~` 的目录。
+    """
+    from norma import cli
+
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setenv("NORMA_LOG_PATH", "rel/audit.log")
+    assert cli.log_path().is_absolute()
+    assert cli.log_path() == tmp_path / "rel" / "audit.log"
+
+    monkeypatch.setenv("NORMA_LOG_PATH", "~/x/audit.log")
+    assert "~" not in cli.log_path().parts
+    assert not (tmp_path / "~").exists()
 
 
 def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):

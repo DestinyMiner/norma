@@ -26,13 +26,18 @@ DEFAULT_LOG_PATH = Path.home() / ".norma" / "audit.log"
 
 
 def log_path() -> Path:
-    """解析审计日志路径。`NORMA_LOG_PATH` 是逃生舱，供测试与调试隔离用。
+    """解析审计日志路径，永远返回绝对路径。`NORMA_LOG_PATH` 是逃生舱，供测试与调试隔离用。
 
-    在**调用时**读环境变量（不在 import 时），这样测试可以直接设它，
-    不必重载模块。
+    在**调用时**读环境变量（不在 import 时），这样测试可以直接设它，不必重载模块。
+
+    逃生舱也要 `expanduser().resolve()`：一个相对路径（或字面的 `~`）会让日志
+    又落回 CWD——也就是这次要修的那个 bug，只是换了个入口进来。实测
+    `NORMA_LOG_PATH=~/x/audit.log` 会在工作目录里建出一个名叫 `~` 的目录。
     """
     override = os.environ.get("NORMA_LOG_PATH", "").strip()
-    return Path(override) if override else DEFAULT_LOG_PATH
+    if not override:
+        return DEFAULT_LOG_PATH
+    return Path(override).expanduser().resolve()
 
 
 def setup_logging() -> Path:
@@ -41,9 +46,16 @@ def setup_logging() -> Path:
     不用 `logging.basicConfig()`：它只要看到根 logger 上已有 handler 就**整个跳过**，
     连 `level=` 一并忽略——于是行为取决于"别的库有没有先配过 logging"。
     显式构造 handler 让这件事变确定。
+
+    **不设防重复调用**（YAGNI）：真实入口 `main()` 只调一次。但要知道代价——
+    调两次会挂两个 handler、同一行写两遍，且前一个句柄不关（`test_cli.py` 里
+    因此要在测后把 handler 摘掉，否则 Windows 上 tmp_path 删不掉）。
     """
     path = log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 只在父目录是我们**新建**的那个时生效，而且只在 POSIX 上有区别：
+    # 那边默认继承 umask（通常 0755），多用户机器上审计日志——里面有全部工具参数、
+    # 路径与命令——就成了同机可读。Windows 走用户目录 ACL，这一项是空操作。
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     handler = logging.FileHandler(path, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))

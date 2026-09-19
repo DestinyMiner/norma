@@ -122,7 +122,7 @@ def decode_text(data: bytes, *, truncated: bool) -> str | None:
         # 一个字符最多 4 字节，所以切点离字符边界最多 3 字节，退到 3 就够。
         for backoff in (1, 2, 3):
             if len(data) <= backoff:
-                break
+                continue
             try:
                 return data[:-backoff].decode("utf-8")
             except UnicodeDecodeError:
@@ -135,12 +135,18 @@ async def _read_file(path: str) -> str:
     if not target.is_file():
         return f"文件不存在：{target}"
 
-    truncated = target.stat().st_size > _READ_CAP_BYTES
+    size = target.stat().st_size
+    truncated = size > _READ_CAP_BYTES
     with target.open("rb") as handle:
         data = handle.read(_READ_CAP_BYTES)
     decoded = decode_text(data, truncated=truncated)
     if decoded is None:
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
+    if truncated:
+        # 这道标记是必须的：不加的话，下面 truncate() 那层标注的"原文 N 字符"
+        # 报的是**我们读进来的那一段**，模型会把它当成整个文件的长度——
+        # 又是一次"工具说了不真的话"。这里报的 size 才是文件真实大小。
+        return f"{decoded}\n…[文件共 {size} 字节，这里只读了开头 {_READ_CAP_BYTES} 字节]"
     return decoded
 
 
@@ -235,8 +241,9 @@ TOOLS: dict[str, Tool] = {
         Tool(
             name="read_file",
             description=(
-                "读取一个文本文件的内容。一次最多返回 8000 字符，超出部分会被截断"
-                "并标注原文长度——没有可以调大这个上限的参数，不要为此重试更大的值。"
+                "读取一个文本文件的内容。一次最多返回 8000 字符；超出会截断并标注"
+                "原文长度，文件过大时也会注明只读了开头——注意标注里的长度是"
+                "**本次读到的长度**，文件更大时会另有说明。"
             ),
             params=ReadFileParams,
             risk=Risk.READ,

@@ -85,7 +85,7 @@ async def test_read_file_roundtrip(tmp_path):
     assert await TOOLS["read_file"].fn(path=str(f)) == "你好世界"
 
 
-async def test_read_file_has_no_max_bytes_parameter():
+def test_read_file_has_no_max_bytes_parameter():
     """`max_bytes` 是假的：真正的闸门是 `truncate()` 的 8000 字符，而它在 `max_bytes`
     之后才生效。实测模型为这个旋钮试了 6万/20万/40万字节，返回一模一样。
 
@@ -95,6 +95,7 @@ async def test_read_file_has_no_max_bytes_parameter():
     """
     schema = openai_schema(TOOLS["read_file"])["function"]
     assert "max_bytes" not in schema["parameters"]["properties"]
+    assert list(schema["parameters"]["properties"]) == ["path"]
     # 描述里必须写死真实上限，否则模型只能靠试参数去发现它
     assert "8000" in schema["description"]
 
@@ -127,6 +128,31 @@ async def test_read_file_reads_a_file_larger_than_the_result_limit(tmp_path):
     assert len(out) > 60000
 
 
+async def test_read_file_says_when_it_only_read_the_head(tmp_path):
+    """超过内部上限时必须自己标一句，**报文件真实大小**。
+
+    不加这一句的话，下一层 `truncate()` 标注的"原文 N 字符"报的是我们读进来的那一段，
+    模型会把它当成整个文件的长度——又是一次"工具说了不真的话"，正是这次要消灭的那类毛病。
+    """
+    f = tmp_path / "huge.txt"
+    f.write_text("x" * 70000, encoding="utf-8")
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert "70000 字节" in out       # 真实大小，不是读到的 64000
+    assert "只读了开头" in out
+
+
+async def test_read_file_does_not_mark_files_it_read_whole(tmp_path):
+    """没被切就不该出现这句标记——否则模型会以为还有下文，去追一个不存在的尾部。"""
+    f = tmp_path / "small.txt"
+    f.write_text("短短", encoding="utf-8")
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert out == "短短"
+
+
 # ---------- decode_text（read_file 的解码回退，单独可测） ----------
 
 def test_decode_text_cut_mid_character_drops_the_partial_character():
@@ -148,11 +174,11 @@ def test_decode_text_reports_a_complete_binary_file():
 def test_decode_text_cut_inside_a_four_byte_character_needs_the_full_backoff():
     """一个字符最多 4 字节，所以切点离字符边界最多 3 字节；只退 1 或 2 的实现会在这条上红。
 
-    构造：末尾是 emoji（4 字节）的**第 1 个字节**。退 1 = `好` + emoji 的前 3 字节（仍非法）、
-    退 2 = `好` + 前 2 字节（仍非法）、退 3 = 正好只剩 `好`（合法）。
+    构造（`'中😀'.encode()[:6]` = `e4 b8 ad f0 9f 98`）：只剩最后 1 个字节可退时，
+    退掉的是 emoji 的第 3 个字节，留下的 `f0 9f` 仍是不完整的序列；退到 3 才剩下完整的 `中`。
     """
-    data = "好".encode("utf-8") + "😀".encode("utf-8")[:1]
-    assert decode_text(data, truncated=True) == "好"
+    data = "中😀".encode("utf-8")[:6]
+    assert decode_text(data, truncated=True) == "中"
 
 
 @pytest.mark.parametrize(
