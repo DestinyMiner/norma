@@ -99,7 +99,8 @@ async def test_execute_permission_denied():
     result = await make_agent(tools=make_tools(Risk.WRITE), ask=deny).execute(
         ToolCall("c1", "echo", {"text": "x"}))
     assert result.ok is False
-    assert result.content == "用户拒绝了这次操作"
+    assert "用户拒绝了这次 echo 调用" in result.content
+    assert "改用其他工具" in result.content
 
 
 async def test_execute_permission_check_failure_fails_closed():
@@ -294,7 +295,8 @@ async def test_permission_denial_is_backfilled():
     events = [e async for e in agent.run("hi")]
 
     assert isinstance(events[-1], Finished)
-    assert agent.messages[2]["content"] == "用户拒绝了这次操作"
+    # 回填文本会说清是哪个工具被拒、并指向别的办法——见 permission.check 的注释
+    assert "用户拒绝了这次 echo 调用" in agent.messages[2]["content"]
 
 
 async def test_read_tool_does_not_trigger_permission_prompt():
