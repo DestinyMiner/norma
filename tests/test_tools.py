@@ -443,6 +443,25 @@ async def test_the_last_readable_page_says_the_rest_cannot_be_read(tmp_path):
     assert "后面还有" not in marker
 
 
+async def test_a_capped_file_mid_page_says_more_follows_within_what_is_readable(tmp_path):
+    """超上限文件的**中途**页：既要"后面还有"，也要带上文件真实大小。
+
+    "后面还有"在这里指"可读部分还没完"——与末页那句"后面读不到了"合起来，
+    模型不必自己猜标记的沉默是什么意思（它就是拿这个决定要不要再读一次的）。
+    """
+    text = "字" * 40000                      # 120000 字节
+    f = tmp_path / "big.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+    marker = out.split("\n", 1)[0]
+
+    assert "后面还有" in marker
+    assert "只读了开头" in marker
+    assert "120000 字节" in marker           # 文件真实大小，不是读到的 64000
+    assert "读不到了" not in marker
+
+
 async def test_offset_past_the_end_says_so_instead_of_returning_nothing(tmp_path):
     """越界必须说清，不能返回空串。
 
