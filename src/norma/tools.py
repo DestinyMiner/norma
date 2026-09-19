@@ -196,7 +196,7 @@ def _child_env() -> dict[str, str]:
 
     config.py 的 load_dotenv() 会把 .env 写进 os.environ，而子进程默认继承——
     于是 `Get-ChildItem env:` 或任何一句 echo 调试都可能把 API key 打进 ToolResult，
-    再顺着模型上下文、CLI 渲染和 norma.log 扩散出去。密钥不该出现在被执行命令的环境里。
+    再顺着模型上下文、CLI 渲染和审计日志扩散出去。密钥不该出现在被执行命令的环境里。
     """
     return {k: v for k, v in os.environ.items() if not k.startswith("NORMA_")}
 
