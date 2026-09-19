@@ -18,6 +18,24 @@ from .tools import TOOLS, Tool, audit, tools_schema, truncate
 
 DEFAULT_MAX_STEPS = 25
 
+# 内核自带的 system prompt。
+#
+# 默认值放内核**而不是客户端**：放客户端的话，下一个客户端（v2 的浏览器客户端）
+# 会再次漏掉它，而"中文提问先用英文答"（backlog 摩擦表 2026-09-16 有现场）就会原样复现。
+# 每一句都在治一个**观察到的**毛病，没有凑数的客套话：
+#   * 语种      —— 中文提问时它第一句用英文回答
+#   * 工具选择  —— 它用 run_powershell 去"找文件"，而 list_dir 明明已经列出来了；
+#                  exec 风险每次都会弹确认框，白弹一次
+#   * 读取上限  —— 它试了 max_bytes 的 6万/20万/40万，因为没人告诉过它上限在哪
+#   * 不编造    —— 实测它已经做对了，把好行为写成契约
+DEFAULT_SYSTEM_PROMPT = (
+    "你是 norma，一个跑在用户自己电脑上的 AI 助手。\n"
+    "始终用中文回答，除非用户明确要求别的语言。\n"
+    "列目录、读文件、写文件要用对应的工具，不要用 run_powershell 去读文件。\n"
+    "read_file 一次最多返回 8000 字符，超出部分会被截断并标注，没有可以调大这个上限的参数。\n"
+    "不确定就说不确定，绝不编造内容；读不到的部分要明说读不到。"
+)
+
 
 @dataclass
 class ExecResult:
@@ -33,11 +51,16 @@ class Agent:
         ask_permission: AskPermission,
         tools: dict[str, Tool] | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        system_prompt: str | None = None,
     ) -> None:
         self.llm = llm
         self.ask_permission = ask_permission
         self.tools = TOOLS if tools is None else tools
         self.max_steps = max_steps
+        # None = 用内核默认；"" = 明确不要 system 消息。两种意图必须分得开。
+        self.system_prompt = (
+            DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
+        )
         self.messages: list[dict] = []
 
     async def execute(self, call: ToolCall) -> ExecResult:
@@ -80,8 +103,24 @@ class Agent:
 
         return ExecResult(True, truncate(output))
 
+    def _ensure_system_message(self) -> None:
+        """把 system 消息钉在 `messages[0]`，只钉一次。
+
+        判据是"本来就有一条 system 消息"，而不是另记一个 `self._initialized` 布尔：
+        这样客户端在构造后自己往 `messages` 里塞了东西（比如将来加载的历史）
+        也不会被我们覆盖，同时也不必维护第二份状态。
+
+        空 prompt 表示**真的不要** system 消息（`system_prompt=""`），那就一条都不插
+        ——插一条空的 system 消息既没意义，也未必被服务端接受。
+        """
+        if not self.system_prompt:
+            return
+        if not any(m.get("role") == "system" for m in self.messages):
+            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+
     async def run(self, user_input: str) -> AsyncIterator[Event]:
         """驱动循环，产出事件流。这是内核唯一的对外入口。"""
+        self._ensure_system_message()
         self.messages.append({"role": "user", "content": user_input})
 
         for _ in range(self.max_steps):

@@ -309,6 +309,9 @@ def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
     stderr = proc.stderr.decode("utf-8", "replace")
     assert "surrogates not allowed" not in stderr
     assert captured, f"一个请求都没发出去：{stderr}"
-    assert json.loads(captured[0])["messages"][-1]["content"] == "列一下当前目录"
+    first_request = json.loads(captured[0])["messages"]
+    assert first_request[0]["role"] == "system"       # system prompt 真的上了线
+    assert "中文" in first_request[0]["content"]
+    assert first_request[-1]["content"] == "列一下当前目录"
     assert (tmp_path / "audit.log").exists()      # 日志落在指定位置
     assert not (tmp_path / "norma.log").exists()  # 而不是工作目录

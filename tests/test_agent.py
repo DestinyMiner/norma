@@ -4,7 +4,7 @@ import pytest
 
 from pydantic import BaseModel, Field
 
-from norma.agent import Agent, ExecResult
+from norma.agent import DEFAULT_SYSTEM_PROMPT, Agent, ExecResult
 from norma.events import Failed, Finished, TextDelta, ToolCallStarted, ToolResult
 from norma.llm import Reply, ToolCall
 from norma.tools import Risk, Tool
@@ -177,9 +177,16 @@ def call(call_id="c1", name="echo", args=None, args_error=""):
     return ToolCall(id=call_id, name=name, args=args or {}, args_error=args_error)
 
 
-def scripted(script, tools=None, ask=allow, max_steps=25) -> Agent:
+def scripted(script, tools=None, ask=allow, max_steps=25, system_prompt="") -> Agent:
+    """照剧本跑的 agent。
+
+    默认 `system_prompt=""`（内核关掉 system 消息）：下面绝大多数用例断言的是
+    `messages` 的**对话形状**，插一条 system 消息只会把每个索引往后推一位、
+    给每条断言加噪音。system prompt 自己的测试在文件末尾，那里显式开它。
+    """
     agent = Agent(llm=FakeLLM(script), tools=tools or make_tools(),
-                  ask_permission=ask, max_steps=max_steps)
+                  ask_permission=ask, max_steps=max_steps,
+                  system_prompt=system_prompt)
     return agent
 
 
@@ -218,6 +225,26 @@ async def test_tool_result_is_backfilled_into_messages():
     tool_msg = agent.messages[2]
     assert tool_msg["tool_call_id"] == "c1"
     assert tool_msg["content"] == "echo:abc"
+
+
+async def test_tool_result_is_backfilled_after_the_system_message():
+    """system prompt 只改 `messages` 的开头，回填的**顺序**不受影响。
+
+    与上一条分开写：上一条守着"回填顺序"（关掉 system 消息看对话形状），
+    这一条守着"开着 system 消息时顺序照样对"——索引整体后移一位这件事
+    由它钉住，而不是让上一条的断言跟着一起漂。
+    """
+    agent = scripted([
+        reply("", [call(name="echo", args={"text": "abc"})]),
+        reply("完成"),
+    ], system_prompt=DEFAULT_SYSTEM_PROMPT)
+
+    [e async for e in agent.run("hi")]
+
+    assert [m["role"] for m in agent.messages] == [
+        "system", "user", "assistant", "tool", "assistant"]
+    assert agent.messages[3]["tool_call_id"] == "c1"
+    assert agent.messages[3]["content"] == "echo:abc"
 
 
 async def test_assistant_message_is_appended_before_tool_result():
@@ -335,6 +362,26 @@ async def test_exceeding_max_steps_yields_failed():
     assert "最大步数 3" in events[-1].reason
 
 
+async def test_max_steps_counts_assistant_rounds_not_tool_calls():
+    """`max_steps` 计的是**模型回合**，不是工具调用次数。
+
+    一轮里提两个工具调用，`max_steps=1` 就该在这一轮之后结束：本轮的工具照常执行、
+    结果照常回填，然后因为用完了回合数而 Failed。按工具调用计数的实现会在这里红
+    ——它会在第一个工具调用之后就把剩余的那个丢掉。
+    """
+    agent = scripted(
+        [reply("", [call("c1"), call("c2")]), reply("不该走到这里")],
+        max_steps=1,
+    )
+    events = [e async for e in agent.run("hi")]
+
+    assert isinstance(events[-1], Failed)
+    results = [e for e in events if isinstance(e, ToolResult)]
+    assert [e.call_id for e in results] == ["c1", "c2"]   # 一轮里的两个都执行了
+    assert [m["role"] for m in agent.messages] == [
+        "user", "assistant", "tool", "tool"]
+
+
 async def test_llm_failure_yields_failed():
     """spec §7 决定 3：API 失败是预期内失败，必须变成 Failed 事件而不是抛穿。"""
 
@@ -384,3 +431,85 @@ async def test_schema_generation_failure_raises_instead_of_masquerading():
 
     with pytest.raises(RuntimeError, match="schema 生成失败"):
         [event async for event in agent.run("hi")]
+
+
+# ---------- system prompt ----------
+
+async def test_default_agent_puts_the_system_prompt_first():
+    """不做任何设置时，`messages[0]` 就该是 system 消息。
+
+    这是内核提供的**默认**行为，不是客户端可选的装饰：默认值放在客户端的话，
+    下一个客户端会再次漏掉它，"中文提问先用英文答"（backlog 摩擦表 2026-09-16）原样复现。
+    """
+    agent = scripted([reply("你好")], system_prompt=None)
+
+    [e async for e in agent.run("hi")]
+
+    assert agent.messages[0]["role"] == "system"
+    assert agent.messages[0]["content"] == DEFAULT_SYSTEM_PROMPT
+
+
+async def test_system_prompt_reaches_the_first_model_call():
+    """钉住"契约真的发出去了"，而不只是"self.messages 里有一条"。
+
+    只看 `agent.messages` 的话，一个把它插在**第一次 llm.chat 之后**的实现也能全绿
+    ——那样第一轮回答依然没有语种约束，缺陷照旧。
+    """
+    agent = scripted([reply("你好")], system_prompt=None)
+    [e async for e in agent.run("hi")]
+
+    first_request = agent.llm.seen_messages[0]
+    assert first_request[0] == {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+    assert first_request[-1]["role"] == "user"
+
+
+async def test_system_prompt_is_inserted_once_across_many_runs():
+    """多轮对话里只该有一条 system 消息，而且一直在最前面。
+
+    它跟着 `messages` 一起重放，不该每轮插一条——那会让上下文线性膨胀，
+    而 prefix 缓存也就废了。
+    """
+    agent = scripted([reply("一"), reply("二")], system_prompt=None)
+
+    [e async for e in agent.run("hi")]
+    [e async for e in agent.run("再来")]
+
+    roles = [m["role"] for m in agent.messages]
+    assert roles.count("system") == 1
+    assert roles[0] == "system"
+    assert roles == ["system", "user", "assistant", "user", "assistant"]
+
+
+async def test_an_empty_system_prompt_really_means_none():
+    """`""` 是"不要 system 消息"这个明确意图，`None` 才是"没表态、用默认"。
+
+    两者混为一谈的话，调用方就没法关掉它——而"关掉"是测试与自定义客户端都会要的。
+    """
+    agent = scripted([reply("你好")], system_prompt="")
+
+    [e async for e in agent.run("hi")]
+
+    assert [m["role"] for m in agent.messages] == ["user", "assistant"]
+
+
+async def test_a_custom_agent_system_prompt_is_used_instead_of_the_default():
+    agent = scripted([reply("好")], system_prompt="只说苏州话。")
+
+    [e async for e in agent.run("hi")]
+
+    assert agent.messages[0]["content"] == "只说苏州话。"
+
+
+def test_default_system_prompt_covers_the_observed_defects():
+    """默认 prompt 的每一句都在治一个**观察到的**毛病，这条防止它被删空。
+
+    四个观察：中文提问先用英文答、拿 run_powershell 去"找文件"白弹确认框、
+    拿 max_bytes 的 6万/20万/40万试探上限、以及它已经做对的"拒绝编造"。
+    """
+    prompt = DEFAULT_SYSTEM_PROMPT
+
+    assert "中文" in prompt            # ① 语种
+    assert "read_file" in prompt       # ② 用对的工具，别拿 exec 去读文件
+    assert "run_powershell" in prompt
+    assert "8000" in prompt            # ③ 读取上限是硬事实，别再试参数
+    assert "编造" in prompt            # ④ 抗幻觉
