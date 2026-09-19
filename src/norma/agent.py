@@ -106,17 +106,23 @@ class Agent:
     def _ensure_system_message(self) -> None:
         """把 system 消息钉在 `messages[0]`，只钉一次。
 
-        判据是"本来就有一条 system 消息"，而不是另记一个 `self._initialized` 布尔：
-        这样客户端在构造后自己往 `messages` 里塞了东西（比如将来加载的历史）
-        也不会被我们覆盖，同时也不必维护第二份状态。
+        判据是**第一条是不是 system 消息**，而不是另记一个 `self._initialized` 布尔：
+        这样客户端在构造后自己往 `messages` 里塞了东西（比如将来加载的历史）不会被覆盖，
+        同时也不必维护第二份状态。
+
+        为什么看位置而不只是"有没有"：`messages[0]` 是这条不变量本身。一个把历史
+        恢复进 `messages`、system 却在中间的客户端，若按"存在即跳过"，我们会把
+        默认 prompt 也跳掉——而中文提问先用英文答的缺陷正是靠这条默认值治的。
+        （客户端自己带的 system 消息照样优先，包括带一条空的——`messages` 是唯一事实来源。）
 
         空 prompt 表示**真的不要** system 消息（`system_prompt=""`），那就一条都不插
         ——插一条空的 system 消息既没意义，也未必被服务端接受。
         """
         if not self.system_prompt:
             return
-        if not any(m.get("role") == "system" for m in self.messages):
-            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+        if self.messages and self.messages[0].get("role") == "system":
+            return
+        self.messages.insert(0, {"role": "system", "content": self.system_prompt})
 
     async def run(self, user_input: str) -> AsyncIterator[Event]:
         """驱动循环，产出事件流。这是内核唯一的对外入口。"""

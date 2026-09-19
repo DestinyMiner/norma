@@ -500,6 +500,49 @@ async def test_a_custom_agent_system_prompt_is_used_instead_of_the_default():
     assert agent.messages[0]["content"] == "只说苏州话。"
 
 
+async def test_system_message_is_pinned_to_index_zero_even_with_history():
+    """客户端先垫了历史时，system 消息要插在**最前面**，而且历史一个字不动。
+
+    这条守的是"判据看位置、不看存在"：`messages[0]` 是这条不变量本身。
+    按"有没有 system 消息"来判断的实现，会在这里把默认 prompt 整个跳掉
+    ——而中文提问先用英文答的缺陷正是靠这条默认值治的（将来 v2 恢复会话历史时
+    就会撞上这个场景：加载的历史里没有 system 消息）。
+
+    变异证明：把 `insert(0, ...)` 改成 `append(...)`，只有这条测试会红——
+    空 `messages` 时两者碰巧一样，所以没有这条用例，这个变异能全绿存活。
+    （调用**时机**在这条路径上不可观测：空列表上 `insert(0, ...)` 与先 append
+    user 再 insert 得到同一条消息序列。别为它编一条测不出来的断言。）
+    """
+    agent = scripted([reply("三")], system_prompt=None)
+    agent.messages = [
+        {"role": "user", "content": "一"},
+        {"role": "assistant", "content": "二"},
+    ]
+
+    [e async for e in agent.run("三")]
+
+    assert [m["role"] for m in agent.messages] == [
+        "system", "user", "assistant", "user", "assistant"]
+    assert agent.messages[0]["content"] == DEFAULT_SYSTEM_PROMPT
+    assert agent.messages[1]["content"] == "一"      # 历史没被动过
+    assert agent.messages[-1]["content"] == "三"
+
+
+async def test_a_client_supplied_system_message_is_not_overwritten():
+    """`messages` 是唯一事实来源：客户端自己带的 system 消息优先，我们不再插默认的。
+
+    带一条**空的**也算数——那是明确的"我自己管"。要关掉默认 prompt，正路是
+    `Agent(system_prompt="")`，但客户端自己垫一条同样该生效。
+    """
+    agent = scripted([reply("好")], system_prompt=None)
+    agent.messages = [{"role": "system", "content": "客户端规则"}]
+
+    [e async for e in agent.run("hi")]
+
+    assert [m["role"] for m in agent.messages] == ["system", "user", "assistant"]
+    assert agent.messages[0]["content"] == "客户端规则"
+
+
 def test_default_system_prompt_covers_the_observed_defects():
     """默认 prompt 的每一句都在治一个**观察到的**毛病，这条防止它被删空。
 

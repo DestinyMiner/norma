@@ -100,6 +100,21 @@ def test_read_file_has_no_max_bytes_parameter():
     assert "8000" in schema["description"]
 
 
+def test_read_file_description_keeps_both_halves_of_the_truth():
+    """描述的两半各治一个毛病，删掉任何一半都会把老问题放回来。
+
+    实测教训：模型试了 `max_bytes` 的 6万/20万/40万，因为它**没有任何地方**能知道
+    上限在哪。所以描述必须同时说清：
+      * 上限是多少（8000），别再试参数——否则就是那次烧步数的重演
+      * 标注里的长度只是**本次读到的**——否则它会把 8000 或 64000 当成文件大小
+    """
+    description = openai_schema(TOOLS["read_file"])["function"]["description"]
+
+    assert "8000" in description
+    assert "不要为此重试更大的值" in description
+    assert "本次读到的长度" in description
+
+
 async def test_read_file_missing(tmp_path):
     out = await TOOLS["read_file"].fn(path=str(tmp_path / "nope.txt"))
     assert "不存在" in out
