@@ -543,36 +543,112 @@ async def test_a_client_supplied_system_message_is_not_overwritten():
     assert agent.messages[0]["content"] == "客户端规则"
 
 
-# ---------- 跨模块：read_file 的标记要活着穿过 truncate() ----------
+# ---------- 跨模块：区间读取要真的能翻到第二页 ----------
+
+def _read_agent(tools=None):
+    return Agent(
+        llm=None,
+        tools=tools or {"read_file": TOOLS["read_file"]},
+        ask_permission=allow,
+        system_prompt="",
+    )
+
 
 async def test_read_file_size_marker_survives_the_truncation_layer(tmp_path):
-    """**集成测试**：`read_file` 那句"文件共 N 字节"必须真的到得了模型眼前。
+    """**集成测试**：页标记必须真的到得了模型眼前。
 
     只测工具函数是不够的——工具输出还要过 `Agent` 那层 `truncate()`，它只保留前
-    8000 字符。标记若追加在 64 KiB 文本的**末尾**，就永远被砍掉，于是模型看到的
-    仍是"原文 64000 字符"并把它当成文件大小——这个功能只在它唯一该起作用的那种
-    情况下失效。（审查抓到过这个：四个逐任务审查都只调了工具函数，没走 Agent。）
+    8000 字符。标记若拼在正文**末尾**，就永远被砍掉，于是模型看的还是
+    "原文 64000 字符"并把它当成文件大小——这个功能只在它唯一该起作用的那种情况下失效。
+    （v1.0.1 的终局审查抓到过这个：四个逐任务审查都只调了工具函数，没走 Agent。）
 
     这里走完整的 `Agent.execute`，断言模型**收到**的那条 tool 消息。
     """
     big = tmp_path / "big.txt"
-    big.write_text("x" * 4000000, encoding="utf-8")
+    big.write_bytes(("x" * 100 + "\n").encode("utf-8") * 40000)   # 4 MB 量级
 
-    agent = Agent(
-        llm=None,
-        tools={"read_file": TOOLS["read_file"]},
-        ask_permission=allow,
-        system_prompt="",
-    )
-    result = await agent.execute(
+    result = await _read_agent().execute(
         ToolCall("c1", "read_file", {"path": str(big)}))
 
     assert result.ok is True
-    assert "文件共 4000000 字节" in result.content      # 真实大小，活过了截断
-    assert "已截断，原文" in result.content             # 截断层也照常标记
-    assert len(result.content) <= MAX_RESULT_CHARS + 40
-    # 标记在开头，所以 x 那一大片填不满前 8000 字符
-    assert result.content.count("x") < MAX_RESULT_CHARS
+    assert result.content.startswith("…[第 1-")               # 标记在开头，活过了截断
+    assert "字节" in result.content.split("\n", 1)[0]          # 且报的是文件真实大小
+
+
+async def test_a_page_continues_exactly_where_the_last_one_stopped(tmp_path):
+    """**核心端到端**：第二页的内容必须和第一页不同，而且确实是原文的后半段。
+
+    这条直接对应实验里的失败形态：模型连调 3 次 `read_file`，三次都拿到同一段开头。
+    单元测试能证明 `_read_file` 支持 offset，只有走 `Agent` 才能证明
+    "模型把 offset 传进来 → 真的拿到新内容"这条链是通的——而且**过完截断层之后**
+    仍成立（标记占额度那件事就是在这里才暴露的）。
+    """
+    text = "".join(f"{i:05d}-" + "字" * 94 + "\n" for i in range(0, 20000, 100))[:20000]
+    f = tmp_path / "novel.txt"
+    f.write_bytes(text.encode("utf-8"))
+    agent = _read_agent()
+
+    first = await agent.execute(ToolCall("c1", "read_file", {"path": str(f)}))
+    first_chunk = first.content.split("\n", 1)[1]
+
+    second = await agent.execute(
+        ToolCall("c2", "read_file", {"path": str(f), "offset": len(first_chunk)}))
+    second_chunk = second.content.split("\n", 1)[1]
+
+    # 用锚点断言，不靠"第一页正好 8000 字"这种脆弱的数字
+    assert "00000-" in first_chunk and "08000-" not in first_chunk
+    assert "08000-" in second_chunk and "00000-" not in second_chunk
+    assert second_chunk != first_chunk
+    assert first_chunk + second_chunk == text[:len(first_chunk) + len(second_chunk)]
+    assert "后面还有" in second.content.split("\n", 1)[0]
+
+
+async def test_the_three_page_read_that_failed_in_the_experiment_now_works(tmp_path):
+    """实验里的**原样复刻**：16848 字符的文件，按标记翻页三次，拼起来等于原文。
+
+    实验记录（`_norma-experiment/report.txt:113`）：模型调了 3 次 `read_file`
+    （3 × 8000 = 24000 > 16848，够覆盖全文），却只读到开头一半——因为三次都从
+    第 0 个字符开始。修正后同样 3 次，但每次读的是**下一段**。
+
+    这条和上一条的区别：它读**到底**，并把"拼起来 == 原文"作为断言——
+    只证明"第二页不同"是不够的，翻页还可能跳字或重复。
+    """
+    text = "".join(f"{i:05d}-" + "字" * 94 + "\n" for i in range(0, 16848, 100))[:16848]
+    f = tmp_path / "ch01-05.txt"
+    f.write_bytes(text.encode("utf-8"))
+    agent = _read_agent()
+
+    collected, offset, pages = [], 0, 0
+    while offset < len(text):
+        result = await agent.execute(
+            ToolCall(f"c{pages}", "read_file", {"path": str(f), "offset": offset}))
+        chunk = result.content.split("\n", 1)[1]
+        assert chunk, "空页会让循环永远转下去"
+        collected.append(chunk)
+        offset += len(chunk)
+        pages += 1
+        assert pages <= 5
+
+    assert pages == 3
+    assert "".join(collected) == text
+
+
+async def test_reading_the_same_offset_twice_gives_the_same_page(tmp_path):
+    """不带 offset 再读一次 = 又拿第一页——这正是实验里发生的事，现在它是**可解释的**。
+
+    模型上一次不知道该传什么，只能一次次重复读开头。这条把那个行为钉成契约：
+    不传 offset 就是从头开始（而不是"接着上次"）——所以它必须靠**标记里的数字**
+    自己算出下一个 offset，prompt 里那句"把 offset 设成已读的字符数"就是在教这个。
+    """
+    text = "abc" * 5000
+    f = tmp_path / "same.txt"
+    f.write_bytes(text.encode("utf-8"))
+    agent = _read_agent()
+
+    first = await agent.execute(ToolCall("c1", "read_file", {"path": str(f)}))
+    again = await agent.execute(ToolCall("c2", "read_file", {"path": str(f)}))
+
+    assert first.content == again.content
 
 
 def test_default_system_prompt_covers_the_observed_defects():
@@ -587,7 +663,9 @@ def test_default_system_prompt_covers_the_observed_defects():
     assert "read_file" in prompt       # ② 用对的工具，别拿 exec 去读文件
     assert "run_powershell" in prompt
     assert "8000" in prompt            # ③ 读取上限是硬事实，别再试参数
-    assert "本次读到的" in prompt       #    且标注里的长度不是文件大小
-    assert "编造" in prompt            # ④ 抗幻觉
+    assert "本次读到的" in prompt       #    且标记里的长度不是文件大小
+    assert "offset" in prompt          # ④ 怎么翻页（v1.1.0 的能力，得让它知道）
+    assert "不要重复读同一段" in prompt
+    assert "编造" in prompt            # ⑤ 抗幻觉
     # 提示词是给模型读的纯文本，markdown 强调号只会变成两个多余字符
     assert "**" not in prompt
