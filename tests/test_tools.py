@@ -219,19 +219,42 @@ async def test_paging_through_a_file_reaches_the_end(tmp_path):
     assert offset == len(text)
 
 
-async def test_offset_is_counted_in_characters_not_bytes(tmp_path):
-    """offset 按**字符**。按字节实现会在这里错位（中文每字 3 字节、emoji 4 字节）。
+@pytest.mark.parametrize("offset", [0, 1, 2, 3, 42, 100, 101, 700, 701])
+async def test_the_returned_page_really_starts_at_the_requested_character(
+        tmp_path, offset):
+    """返回的那段必须**真的**是原文的第 offset+1 个字符起——不能只是自称是。
 
-    模型脑子里数的是字符（它的原话是"没有 offset 参数"），字节语义会让它算不准，
-    还会把 v1.0.1 刚清掉的那类"切在多字节字符中间"的 bug 请回来。
+    为什么不能用 `text[offset:offset+n]` 来断言：那是拿实现跟它自己比。**标记与正文
+    由同一个 offset 推出**，所以两者天然自洽——一个错位的实现会诚实地标着
+    "第 2-8 字符"、也诚实地返回它以为的第 2-8 字符，两边都不说谎，而给的并不是
+    文件的第 2 个字符。核对位置才能发现这种事，核对自洽不能。
+
+    文件内容按位置造得**唯一**（`<0000>中` 这种），所以"这段内容出现在哪"只有一个答案；
+    否则重复字符会让 `str.index` 命中第一个出现处，核对不出错位。
     """
-    text = "中" * 100 + "😀" * 20 + "abc" * 50
-    f = tmp_path / "mixed.txt"
-    f.write_text(text, encoding="utf-8")
+    text = "".join(f"<{i:04d}>" + ("中" if i % 3 else "😀") for i in range(300))
+    f = tmp_path / "positioned.txt"
+    f.write_bytes(text.encode("utf-8"))
 
-    for offset in (0, 1, 99, 100, 101, 120, 140):
-        out = await TOOLS["read_file"].fn(path=str(f), offset=offset, limit=7)
-        assert out.split("\n", 1)[1] == text[offset:offset + 7], f"offset={offset}"
+    out = await TOOLS["read_file"].fn(path=str(f), offset=offset, limit=7)
+    marker, chunk = out.split("\n", 1)
+
+    assert len(chunk) == 7
+    assert text.index(chunk) == offset        # 位置对，不只是内容自洽
+    assert f"第 {offset + 1}-{offset + 7} 字符" in marker
+
+
+async def test_a_tiny_limit_still_returns_that_many_characters(tmp_path):
+    """标记**不从模型要的 limit 里扣**：`limit=5` 就得回 5 个字符。
+
+    从 limit 扣的话，小 limit 会被标记（几十个字符）吃光、返回空内容——比不给这个
+    参数还糟。额度是从**总上限**扣的（见下一条），两者不能混。
+    """
+    f, _ = _paged_file(tmp_path)
+
+    out = await TOOLS["read_file"].fn(path=str(f), limit=5)
+
+    assert len(out.split("\n", 1)[1]) == 5
 
 
 async def test_limit_cannot_exceed_the_hard_result_ceiling(tmp_path):
