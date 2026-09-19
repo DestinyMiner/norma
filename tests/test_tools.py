@@ -151,7 +151,7 @@ async def test_read_file_says_when_it_only_read_the_head(tmp_path):
 
     不加这一句的话，页标记里的"共 N 字符"只是我们读进来的那一段的长度，
     模型会把它当成整个文件的长度——又是一次"工具说了不真的话"。
-    （v1.0.1 的终局审查抓到过这个错的另一种形态：标记被 truncate 砍掉了。）
+    （v1.0.1 的终局审查抓到过这个错的另一种形态：标记被截断层砍掉了。）
     """
     f = tmp_path / "huge.txt"
     f.write_text("x" * 70000, encoding="utf-8")
@@ -160,6 +160,42 @@ async def test_read_file_says_when_it_only_read_the_head(tmp_path):
 
     assert "70000 字节" in out          # 真实**字节**大小，不是读到的 64000
     assert "只读了开头" in out
+
+
+async def test_a_file_exactly_at_the_cap_is_not_reported_as_cut(tmp_path):
+    """恰好等于读取上限的文件**不算被切**——差一就会在这里说谎。
+
+    `size > _READ_CAP_BYTES` 写成 `>=` 的话，一个正好 64000 字节的文件会被标成
+    "文件共 64000 字节，只读了开头 64000 字节"：模型会以为后面还有，去追一个不存在的
+    尾部（白烧一步），或者干脆放弃已经读全的内容。整块都读进来了，就没什么可标的。
+    """
+    from norma.tools import _READ_CAP_BYTES
+
+    text = "x" * _READ_CAP_BYTES
+    f = tmp_path / "exact.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert "只读了开头" not in out
+    assert out.startswith("…[第 1-")     # 一页没装下，所以页标记照旧
+
+
+async def test_a_cut_landing_mid_character_is_not_reported_as_binary(tmp_path):
+    """读取上限正好落在多字节字符中间时，那半个字符是**我们切出来的**，不是二进制。
+
+    中文每字 3 字节，64000 不是 3 的倍数，所以"截在字符中间"是常态而非巧合。
+    这里直接构造那个字节边界（64000 字节的汉字文本），确认不会误报二进制。
+    """
+    from norma.tools import _READ_CAP_BYTES
+
+    f = tmp_path / "cn.txt"
+    f.write_bytes(("中" * 22000).encode("utf-8")[:_READ_CAP_BYTES])
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert "无法按 UTF-8 解码" not in out
+    assert out.startswith("…[第 1-")
 
 
 async def test_read_file_does_not_mark_files_it_read_whole(tmp_path):
