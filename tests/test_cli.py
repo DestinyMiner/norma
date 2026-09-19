@@ -139,13 +139,13 @@ def test_read_line_drops_a_late_answer_after_the_loop_is_closed(monkeypatch):
 def test_third_party_info_does_not_pollute_the_audit_log(tmp_path, monkeypatch):
     """httpx2 为每个 HTTP 请求打一条 INFO；根级别若为 INFO，审计日志就被传输层噪音淹没。
 
-    用户查 norma.log 是为了知道助手到底做了什么，所以这条不是洁癖。
+    用户查审计日志是为了知道助手到底做了什么，所以这条不是洁癖。
     """
     import logging
 
     from norma import cli
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NORMA_LOG_PATH", str(tmp_path / "audit.log"))
     cli.setup_logging()
 
     assert logging.getLogger().level == logging.WARNING
@@ -156,26 +156,25 @@ def test_third_party_info_does_not_pollute_the_audit_log(tmp_path, monkeypatch):
 def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
     """上一条测试在 pytest 里会"因为错误的理由通过"——这条守的才是真正的行为。
 
-    logging.basicConfig() 只要看到根 logger 上已有 handler 就**整个跳过**，
-    level= 一并忽略；而 pytest 自己会往根上挂 handler（实测 4 个），根 logger 的
-    默认级别又本来就是 WARNING。两者叠加的结果是：把 level 改回 INFO，上一条测试
-    仍然全绿——它测的是 Python 的默认值，不是我们的配置。
+    pytest 自己会往根上挂 handler（实测 4 个），根 logger 的默认级别又本来就是
+    WARNING。两者叠加的结果是：把 level 改回 INFO，上一条测试仍然全绿——
+    它测的是 Python 的默认值，不是我们的配置。
 
-    这里把根 handler 暂时摘掉，让 basicConfig 真正生效，也就是真实 CLI 进程里的
-    情形（那里根上没有任何 handler）。用完在 finally 里原样恢复。
+    这里把根 handler 暂时摘掉，让配置真正生效，也就是真实 CLI 进程里的情形
+    （那里根上没有任何 handler）。用完在 finally 里原样恢复。
     """
     import logging
 
     from norma import cli
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NORMA_LOG_PATH", str(tmp_path / "audit.log"))
 
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_level = root.level
     saved_audit = logging.getLogger("norma.audit").level
 
-    root.handlers[:] = []          # 否则 basicConfig 直接跳过
+    root.handlers[:] = []
     root.setLevel(logging.NOTSET)  # 清掉 WARNING 默认值，逼出真实配置
     try:
         cli.setup_logging()
@@ -190,6 +189,49 @@ def test_setup_logging_really_raises_the_root_level(tmp_path, monkeypatch):
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
         logging.getLogger("norma.audit").setLevel(saved_audit)
+
+
+def test_audit_log_does_not_land_in_the_working_directory(tmp_path, monkeypatch):
+    """**回归测试**：日志写在 CWD 时会出现在 `list_dir` 结果里，被模型当内容读。
+
+    实测过一次（`_norma-experiment`）：模型看见工作目录里的 `norma.log`，
+    于是调 `read_file` 去读它——白烧一步。这里 chdir 到一个空目录，
+    断言日志落在别处、且工作目录里什么都没多出来。
+    """
+    import logging
+
+    from norma import cli
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    log_file = tmp_path / "logs" / "audit.log"
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("NORMA_LOG_PATH", str(log_file))
+
+    assert cli.setup_logging() == log_file        # 父目录不存在也要自己建出来
+    logging.getLogger("norma.audit").info("tool=list_dir ok=True")
+
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    assert log_file.exists()
+    assert "tool=list_dir ok=True" in log_file.read_text(encoding="utf-8")
+    assert list(workdir.iterdir()) == []          # 工作目录干干净净
+
+
+def test_default_log_path_is_outside_the_working_directory(monkeypatch):
+    """没设逃生舱时，默认路径必须是用户目录下的固定位置，且不是相对路径。
+
+    相对路径 = 跟着 CWD 走 = 这个 bug 会以另一种形式回来。
+    """
+    monkeypatch.delenv("NORMA_LOG_PATH", raising=False)
+
+    from norma import cli
+
+    path = cli.log_path()
+    assert path.is_absolute()
+    assert path.parent.name == ".norma"
+    assert path.name == "audit.log"
 
 
 def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
@@ -240,6 +282,9 @@ def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
 
     env = dict(os.environ)
     env.pop("PYTHONIOENCODING", None)  # 不许靠这个拐杖蒙混过关
+    # 审计日志指向 tmp_path：否则这条真子进程会往用户的 ~/.norma/audit.log 里写，
+    # 测试就不该有这种副作用。（顺带证明 NORMA_LOG_PATH 逃生舱真的管用。）
+    env["NORMA_LOG_PATH"] = str(tmp_path / "audit.log")
     env.update({
         "NORMA_API_KEY": "sk-fake",
         "NORMA_BASE_URL": f"http://127.0.0.1:{server.server_address[1]}/v1",
@@ -265,3 +310,5 @@ def test_piped_chinese_reaches_the_model_through_a_real_subprocess(tmp_path):
     assert "surrogates not allowed" not in stderr
     assert captured, f"一个请求都没发出去：{stderr}"
     assert json.loads(captured[0])["messages"][-1]["content"] == "列一下当前目录"
+    assert (tmp_path / "audit.log").exists()      # 日志落在指定位置
+    assert not (tmp_path / "norma.log").exists()  # 而不是工作目录

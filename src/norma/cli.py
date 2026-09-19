@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import threading
+from pathlib import Path
 
 from .agent import Agent
 from .config import Config
@@ -16,21 +18,45 @@ from .events import Event, Failed, Finished, TextDelta, ToolCallStarted, ToolRes
 from .llm import LLM
 from .tools import Tool
 
-LOG_PATH = "norma.log"
+# 审计日志的固定位置。**绝不能写进 CWD**：那会污染用户的工作目录，而且日志文件会
+# 出现在 `list_dir` 的结果里被模型当成内容读（实测白烧一步）。
+# 用 `~/.norma/` 而不是 Windows 专有的 `%APPDATA%`：两个平台同一条路径，代码里
+# 不必出现平台分支（Path.home() 在 Windows 上就是 C:\Users\<name>）。
+DEFAULT_LOG_PATH = Path.home() / ".norma" / "audit.log"
 
 
-def setup_logging() -> None:
-    logging.basicConfig(
-        filename=LOG_PATH,
-        # 根日志只留 WARNING 以上：httpx2 会为**每个** HTTP 请求打一条 INFO，
-        # 落进 norma.log 就会把"助手到底做了什么"淹在传输层噪音里——
-        # 而查这份日志正是这个文件存在的理由。
-        level=logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
-        encoding="utf-8",
-    )
+def log_path() -> Path:
+    """解析审计日志路径。`NORMA_LOG_PATH` 是逃生舱，供测试与调试隔离用。
+
+    在**调用时**读环境变量（不在 import 时），这样测试可以直接设它，
+    不必重载模块。
+    """
+    override = os.environ.get("NORMA_LOG_PATH", "").strip()
+    return Path(override) if override else DEFAULT_LOG_PATH
+
+
+def setup_logging() -> Path:
+    """配置审计日志，返回实际写入的路径（调用方要把它显示给用户）。
+
+    不用 `logging.basicConfig()`：它只要看到根 logger 上已有 handler 就**整个跳过**，
+    连 `level=` 一并忽略——于是行为取决于"别的库有没有先配过 logging"。
+    显式构造 handler 让这件事变确定。
+    """
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    # 根日志只留 WARNING 以上：httpx2 会为**每个** HTTP 请求打一条 INFO，
+    # 落进审计日志就会把"助手到底做了什么"淹在传输层噪音里——
+    # 而查这份日志正是这个文件存在的理由。
+    root.setLevel(logging.WARNING)
     # 我们自己的审计日志要 INFO，显式打开，否则会被上面的根级别一并挡掉。
     logging.getLogger("norma.audit").setLevel(logging.INFO)
+
     # stdin 也在内：输入被重定向（`echo "帮我整理目录" | norma`）时，Windows 按本地
     # 代码页（本机 GBK）解码并启用 surrogateescape，中文字节会变成 \udc95 这类代理转义，
     # 随后在 JSON 编码时炸掉——而且报出来是"模型调用失败"，把人支去找网络和密钥，
@@ -45,6 +71,7 @@ def setup_logging() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, OSError, ValueError):
             pass  # 流被换成不支持 reconfigure 的对象时跳过，不能因此影响主流程
+    return path
 
 
 def _finish(future: asyncio.Future, value: object) -> None:
@@ -127,8 +154,8 @@ def render(event: Event) -> None:
             print(f"\n[失败] {reason}", file=sys.stderr)
 
 
-async def repl(agent: Agent) -> None:
-    print(f"norma 已就绪（审计日志：{LOG_PATH}）。直接输入内容开始对话，空行退出。")
+async def repl(agent: Agent, log_file: Path) -> None:
+    print(f"norma 已就绪（审计日志：{log_file}）。直接输入内容开始对话，空行退出。")
     while True:
         try:
             line = (await _read_line("\n你> ")).strip()
@@ -142,7 +169,7 @@ async def repl(agent: Agent) -> None:
 
 
 def main() -> None:
-    setup_logging()
+    log_file = setup_logging()
 
     try:
         config = Config.from_env()
@@ -157,6 +184,6 @@ def main() -> None:
     )
 
     try:
-        asyncio.run(repl(agent))
+        asyncio.run(repl(agent, log_file))
     except KeyboardInterrupt:
         print()
