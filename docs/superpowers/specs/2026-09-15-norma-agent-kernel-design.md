@@ -748,7 +748,7 @@ Electron 是大承诺：构建工具链、打包、把内核当 sidecar 拉起�
 - **朋友用的是 macOS，而 norma 是 Windows 优先写的。** 平台耦合面很小但很具体：**只有 `tools.py` 一处**——`_SHELL = shutil.which("pwsh") or shutil.which("powershell") or "powershell"` 在 macOS 上两个 `which` 都返回 `None`，降级到字面量 `"powershell"`，于是 `run_powershell` 抛 `FileNotFoundError`。走 agent 时会被 §9 的兜底转成「工具报错：…」回填（循环不死），但**该工具在 Mac 上等于废掉**；`tests/test_tools.py` 里 6 条 PowerShell 用例也会红。其余全部跨平台（`list_dir`/`read_file`/`write_file` 是纯 pathlib；`cli.py` 的编码修复在 macOS 上是无害空操作）。
   - **零代码缓解**：`brew install --cask powershell` 让 `which("pwsh")` 命中，EXEC 大概率可用（`[Console]::OutputEncoding` 在 macOS 的 pwsh 上是否可设**未经验证**，但即便抛异常也是 graceful 失败）。
   - **不要现在改**：没有 Mac 无法验证，而盲改平台路径正是 v1 里反复栽跟头的同一类错误。正确形态是 v2 的「按平台选 shell」（Windows → PowerShell，POSIX → `sh`），顺带把工具改名 `run_shell`。
-  - 朋友那边的测试预期：**91 绿 / 6 红**（红的全是 PowerShell 用例），需要提前告知，否则会被当成代码坏了。
+  - 朋友那边的测试预期：**6 条红**（红的全是 PowerShell 用例；其余全绿，v1.0.1 时总数是 121），需要提前告知，否则会被当成代码坏了。
 
 ### v2 的第一条纪律
 
