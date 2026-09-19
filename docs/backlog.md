@@ -99,7 +99,26 @@
 
 ---
 
-## 四、会话怎么切
+## 四、本机环境（换会话/换机器时先看这一段）
+
+这台机器有几个坑，踩过一遍，别再踩：
+
+| 坑 | 对策 |
+|---|---|
+| `python` 是 **0 字节的 Microsoft Store 占位程序**，运行返回 9009 | 一律用 **`E:\learning\ai\norma\.venv\Scripts\python.exe`**；`norma` 命令用 `.venv\Scripts\norma.exe` |
+| 真实 Python 在 `E:\tools\python\`，**不在 PATH** | 同上。建 venv 用 `E:\tools\python\python.exe -m venv .venv` |
+| `origin` 指向 `githubproxy.cc`，**它只代理拉取，不支持 push** | 推送走本机 Clash：<br>`git -c http.proxy=http://127.0.0.1:7890 push https://github.com/DestinyMiner/norma.git main` |
+| **Clash 占着系统代理（127.0.0.1:7890）**，而 `httpx2` 认 `ProxyServer` 却不认 `ProxyOverride` 的 `127.*` | 发往 localhost 的请求要显式 `NO_PROXY=127.0.0.1,localhost`。测试已自带（`tests/test_cli.py`）；**将来把 `NORMA_BASE_URL` 指向本地模型时会踩到**（见 spec §14） |
+| 用 PowerShell 的 `Get-Content`/`Set-Content` 读写源码会**按 GBK 往返破坏 UTF-8** | 改文件一律用编辑工具，不要用 PowerShell 文本 cmdlet |
+| PowerShell 的 `>` 会把原生命令输出**转码成 UTF-16LE** | 要检查真实字节就用 Python 子进程的裸句柄 |
+
+**另外**：这个会话里曾经把小说按章切好放在
+`E:\learning\ai\whispering-verse-game\game-script\chapters\`（00-设定 / 01-序章 / 02-第一卷 / 03-第二卷），
+每章都在诺玛 8000 字符的读取上限内。
+
+---
+
+## 五、会话怎么切
 
 **按任务切，不按角色切。** 会话的单位是「**一个能关闭的目标**」，不是「一个职位」。
 
@@ -115,7 +134,7 @@
 **不要为「监督」建常驻 agent。** 监督已经在流程里了（每个任务都有独立审查者）。
 常驻角色会变成你要维护的另一件事。
 
-## 五、分工（人和 AI）
+## 六、分工（人和 AI）
 
 | | 谁做 | 产出 |
 |---|---|---|
@@ -127,7 +146,7 @@
 **人不需要写 bug 报告。** 诺玛已经把每次工具调用写进 `norma.log` 了；
 人只要产出现场，**分析是下一阶段的活**。
 
-## 六、会话开工前读什么
+## 七、会话开工前读什么
 
 1. **这份文件**（3 分钟）
 2. `docs/superpowers/specs/2026-09-15-norma-agent-kernel-design.md` 的 **§17**
@@ -137,7 +156,7 @@
 **这三份读完就能冷启动，跟你隔了 1 天还是 2 周无关。** 所以：**长会话可以放心关掉**——
 决策该由文件驱动，不该由"我还记得聊过什么"驱动。
 
-## 七、会话收尾时做什么
+## 八、会话收尾时做什么
 
 **把状态写进文件，不要留给下一次对话去记。** 具体地：
 
