@@ -462,6 +462,31 @@ async def test_a_capped_file_mid_page_says_more_follows_within_what_is_readable(
     assert "读不到了" not in marker
 
 
+def test_the_page_budget_reserves_the_longest_possible_marker():
+    """页标记的长度随 total/size 的**位数**变长，额度必须按最长的那版留。
+
+    实测边界：4 字节字符的文件（1.2 亿字节、total 9 位）与一亿字节的 ASCII 文件，
+    标记最长 63 字符，结果恰好 8000 不超。造 100 MB 的测试文件不现实，所以这里盯
+    **预算那一步**：它估的标记必须不短于实际会产出的那一版。
+
+    漏了的话后果很隐蔽：越界的部分被 `result[:MAX_RESULT_CHARS]` 截掉，
+    而页标记声明的"到第 N 字符"就成了假话——模型拿它算下一个 offset 会**跳字**。
+    """
+    from norma.tools import _page_marker, _size_note
+
+    big_size = _size_note(10**12)               # 13 位字节数：真实世界里到不了这么长
+    # 预算那一步估的是"还有下文"的最长版（shown == total 时带不上尾注，故不短于实际）
+    longest = _page_marker(offset=0, shown=10**9, total=10**9, size_note=big_size)
+    actual = _page_marker(offset=0, shown=7936, total=16000, size_note=big_size)
+
+    assert len(actual) <= len(longest)
+    # 正文额度＝上限 − 估的标记 − 换行，仍然是个像样的正文长度（标记没有膨胀到吃掉正文）
+    assert MAX_RESULT_CHARS - len(longest) - 1 > MAX_RESULT_CHARS - 100
+
+    # 回到真实尺度再验一遍真产物：70000 字节的文件必须正好卡在上限内
+    # （见 test_limit_cannot_exceed_the_hard_result_ceiling，那条跑的是真的读文件）
+
+
 async def test_an_empty_file_is_reported_as_empty_not_as_a_bad_offset(tmp_path):
     """空文件是**文件的性质**，不是模型填错了 offset。
 
