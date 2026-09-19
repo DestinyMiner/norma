@@ -147,6 +147,7 @@ def _decode_or_none(data: bytes) -> str | None:
 
 
 _PAGE_TAIL = "，后面还有"
+_PAGE_TAIL_CAPPED = "，后面读不到了"
 
 # 页标记里"文件只读了开头 N 字节"那一句——空串表示不写（见 _page_marker）
 _SIZE_NOTE = f"（文件共 {{size}} 字节，只读了开头 {_READ_CAP_BYTES} 字节）"
@@ -157,16 +158,23 @@ def _page_marker(offset: int, shown: int, total: int, size_note: str = "") -> st
 
     标记回答模型两个问题：这是第几到第几个字符、后面还有没有。
 
-    `size_note` 非空表示"文件比读取上限长，我们只读了开头"：这时 `total` 只是**读到的那段**
-    的长度，必须同时报出文件真实字节数，否则模型会把 `total` 当成整个文件的长度
-    ——"工具说了不真的话"，正是 v1.0.1 要消灭的那类毛病（终局审查抓到过它的另一种形态：
-    标记写在末尾被 truncate 砍掉，等于没写）。
+    **必须区分两种"到头了"**（`size_note` 非空 = 文件超过读取上限）：
+      * 文件本身到头 → 什么都不加（模型该收尾了）
+      * 只是**可读部分**到头 → 明说"后面读不到了"
+    不说的话，一个照 prompt 办的模型会看到标记不带"后面还有"、于是拿终点当 offset
+    再试一次——那一次注定是"偏移超出文件长度"（实测：120000 字节的文件在第 4 步浪费
+    一步）。**标记沉默会被读成"你自己判断吧"，而它其实知道后面读不到。**
+
+    `size_note` 非空时还要报出文件真实字节数，否则模型会把 `total`（只是读到的那段）
+    当成整个文件的长度——"工具说了不真的话"，正是 v1.0.1 要消灭的那类毛病。
 
     **调用方必须把它放在结果开头**：结果还要过 `Agent` 那层只保留前 8000 字符的截断。
     """
     head = f"…[第 {offset + 1}-{offset + shown} 字符，共 {total} 字符{size_note}"
     if offset + shown < total:
         head += _PAGE_TAIL
+    elif size_note:
+        head += _PAGE_TAIL_CAPPED
     return head + "]"
 
 

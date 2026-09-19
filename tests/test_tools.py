@@ -412,6 +412,35 @@ async def test_page_marker_says_where_you_are_and_whether_more_follows(tmp_path)
     last = await TOOLS["read_file"].fn(path=str(f), offset=16000)
     assert last.startswith("…[第 16001-16848 字符，共 16848 字符")
     assert "后面还有" not in last.split("\n", 1)[0]
+    # 文件本身到头、也不是超上限文件：不加任何尾注，模型该收尾了
+    assert "读不到" not in last.split("\n", 1)[0]
+
+
+async def test_the_last_readable_page_says_the_rest_cannot_be_read(tmp_path):
+    """超上限文件的**最后一页**必须明说"后面读不到了"，不能只是沉默。
+
+    沉默会被读成"你自己判断吧"：一个照 prompt 办的模型看到标记不带"后面还有"、
+    于是拿终点当 offset 再试一次——而那一次注定是"偏移超出文件长度"。
+    实测（120000 字节的文件）：第 3 页就是可读末尾，第 4 次调用白烧在报错上。
+    标记其实**知道**后面读不到（它已经写着"只读了开头 64000 字节"），就该直说。
+    """
+    text = "字" * 40000                      # 120000 字节，远超 64000
+    f = tmp_path / "big.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    offset, pages = 0, 0
+    while pages < 20:
+        out = await TOOLS["read_file"].fn(path=str(f), offset=offset)
+        marker, chunk = out.split("\n", 1)
+        offset += len(chunk)
+        pages += 1
+        if "后面还有" not in marker:
+            break
+
+    assert pages == 3
+    assert "只读了开头" in marker            # 文件比读到的长
+    assert "读不到了" in marker              # 而这就是可读的末尾——直说
+    assert "后面还有" not in marker
 
 
 async def test_offset_past_the_end_says_so_instead_of_returning_nothing(tmp_path):
