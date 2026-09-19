@@ -555,4 +555,7 @@ def test_default_system_prompt_covers_the_observed_defects():
     assert "read_file" in prompt       # ② 用对的工具，别拿 exec 去读文件
     assert "run_powershell" in prompt
     assert "8000" in prompt            # ③ 读取上限是硬事实，别再试参数
+    assert "本次读到的" in prompt       #    且标注里的长度不是文件大小
     assert "编造" in prompt            # ④ 抗幻觉
+    # 提示词是给模型读的纯文本，markdown 强调号只会变成两个多余字符
+    assert "**" not in prompt
