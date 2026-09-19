@@ -1,7 +1,10 @@
 import logging
 
+import pytest
+
 from norma.tools import (
-    MAX_RESULT_CHARS, TOOLS, Risk, Tool, openai_schema, tools_schema, truncate,
+    MAX_RESULT_CHARS, TOOLS, Risk, Tool, decode_text, openai_schema, tools_schema,
+    truncate,
 )
 
 
@@ -82,10 +85,18 @@ async def test_read_file_roundtrip(tmp_path):
     assert await TOOLS["read_file"].fn(path=str(f)) == "你好世界"
 
 
-async def test_read_file_respects_max_bytes(tmp_path):
-    f = tmp_path / "a.txt"
-    f.write_text("0123456789", encoding="utf-8")
-    assert await TOOLS["read_file"].fn(path=str(f), max_bytes=4) == "0123"
+async def test_read_file_has_no_max_bytes_parameter():
+    """`max_bytes` 是假的：真正的闸门是 `truncate()` 的 8000 字符，而它在 `max_bytes`
+    之后才生效。实测模型为这个旋钮试了 6万/20万/40万字节，返回一模一样。
+
+    这条测试是防止它被"顺手加回来"——**参数表是模型唯一能看到的地方**，
+    多一个骗人的参数就多一次骗人的机会。要恢复区间读取，正确的是 `offset`/`limit`
+    （见 docs/superpowers/plans/2026-09-16-v1.0.1-design.md §10），不是字节数。
+    """
+    schema = openai_schema(TOOLS["read_file"])["function"]
+    assert "max_bytes" not in schema["parameters"]["properties"]
+    # 描述里必须写死真实上限，否则模型只能靠试参数去发现它
+    assert "8000" in schema["description"]
 
 
 async def test_read_file_missing(tmp_path):
@@ -100,24 +111,62 @@ async def test_read_file_binary_is_reported_not_crashed(tmp_path):
     assert "无法按 UTF-8 解码" in out
 
 
-async def test_read_file_truncation_mid_character_is_not_reported_as_binary(tmp_path):
-    """中文文本按字节截断时不该被误报成二进制文件（每字 3 字节）。"""
-    f = tmp_path / "cn.txt"
-    f.write_text("中文测试" * 100, encoding="utf-8")
-    # 10 字节 = 3 个完整汉字（9 字节）+ 第 4 个字的第 1 个字节
-    out = await TOOLS["read_file"].fn(path=str(f), max_bytes=10)
-    assert "无法按 UTF-8 解码" not in out
-    assert out.startswith("中文测")
+async def test_read_file_reads_a_file_larger_than_the_result_limit(tmp_path):
+    """内部 64 KiB 上限：读得动、不崩，且没被误报成二进制。
 
-
-async def test_untruncated_binary_file_is_reported_as_binary(tmp_path):
-    """未截断时不该走回退路径——否则末字节非法的二进制会被当成文本返回。"""
-    f = tmp_path / "b.bin"
-    f.write_bytes(b"abc\xff\xfe")
+    这条钉住内部上限的**存在与量级**（而不是继续暴露一个假参数）。上限之外
+    还有一层 8000 字符的结果截断在 `Agent` 里，两者都在时**决定模型看见多少的是后者**。
+    """
+    f = tmp_path / "big.txt"
+    f.write_text("x" * 70000, encoding="utf-8")
 
     out = await TOOLS["read_file"].fn(path=str(f))
 
-    assert "无法按 UTF-8 解码" in out
+    assert "无法按 UTF-8 解码" not in out
+    assert len(out) < 70000          # 上限真的在起作用
+    assert len(out) > 60000
+
+
+# ---------- decode_text（read_file 的解码回退，单独可测） ----------
+
+def test_decode_text_cut_mid_character_drops_the_partial_character():
+    """中文每字 3 字节，按字节切经常正好切在一个字中间。
+
+    这种残片**是我们自己切的**，必须丢掉残字返回完整前缀，而不是把整份中文
+    误报成二进制文件。（原实现靠传入小 `max_bytes` 构造这个输入；参数删掉后
+    直接喂裸字节，覆盖不丢。）
+    """
+    data = "中文测试".encode("utf-8")
+    assert decode_text(data[:10], truncated=True) == "中文测"   # 3 字 + 第 4 字的第 1 字节
+
+
+def test_decode_text_reports_a_complete_binary_file():
+    """反过来：没被截断就是文件本身坏，不能说成"可能切在字中间"而把二进制当文本返回。"""
+    assert decode_text(b"abc\xff\xfe", truncated=False) is None
+
+
+def test_decode_text_cut_inside_a_four_byte_character_needs_the_full_backoff():
+    """一个字符最多 4 字节，所以切点离字符边界最多 3 字节；只退 1 或 2 的实现会在这条上红。
+
+    构造：末尾是 emoji（4 字节）的**第 1 个字节**。退 1 = `好` + emoji 的前 3 字节（仍非法）、
+    退 2 = `好` + 前 2 字节（仍非法）、退 3 = 正好只剩 `好`（合法）。
+    """
+    data = "好".encode("utf-8") + "😀".encode("utf-8")[:1]
+    assert decode_text(data, truncated=True) == "好"
+
+
+@pytest.mark.parametrize(
+    "cut,expected",
+    [(4, "好"), (5, "好"), (6, "好"), (7, "好😀")],
+)
+def test_decode_text_never_reports_a_truncated_text_file_as_binary(cut, expected):
+    """**每一个**可能的切点都要能救回来——这是中文文本不被误报成二进制的全部保证。
+
+    固定退 1/2/3 字节在这里是够的（一个字符最多 4 字节，切点离边界最多 3 字节），
+    但"够"要靠枚举证明，不能靠推理：这四条覆盖了 4 字节字符的每一个切点。
+    """
+    data = "好😀".encode("utf-8")[:cut]
+    assert decode_text(data, truncated=True) == expected
 
 
 # ---------- write_file ----------

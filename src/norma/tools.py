@@ -14,6 +14,12 @@ from pydantic import BaseModel, Field
 
 MAX_RESULT_CHARS = 8000
 
+# read_file 的内部读取上限。**不是承诺，是缓冲区大小**——真正决定模型看见多少的
+# 是上面那道 8000 字符的结果截断（它管所有工具，见 agent.py 的 truncate 调用）。
+# 这个常量只干一件事：把文件按字节切开之后，才能判断"末尾那个非法字节是不是我们自己
+# 切的"——那是下面二进制回退逻辑的前提。顺带让一个 200MB 的文件不会被整个读进内存。
+_READ_CAP_BYTES = 64000
+
 log = logging.getLogger("norma.audit")
 
 
@@ -93,27 +99,27 @@ async def _list_dir(path: str = ".") -> str:
 
 class ReadFileParams(BaseModel):
     path: str = Field(..., description="要读取的文件路径")
-    max_bytes: int = Field(64000, description="最多读取的字节数")
 
 
-async def _read_file(path: str, max_bytes: int = 64000) -> str:
-    target = Path(path).expanduser()
-    if not target.is_file():
-        return f"文件不存在：{target}"
+def decode_text(data: bytes, *, truncated: bool) -> str | None:
+    """把读进来的字节解码成文本；`None` 表示这不是 UTF-8 文本。
 
-    # 只在**确实是我们截断的**时候才允许回退：否则一个末字节恰好非法的二进制文件
-    # 会被当成文本悄悄返回。st_size 比较是精确条件，"len(data) == max_bytes"
-    # 在文件恰好等于 max_bytes 时会判错。
-    truncated = target.stat().st_size > max_bytes
-    with target.open("rb") as handle:
-        data = handle.read(max_bytes)
+    `truncated=True` 只表示**这批字节是被读文件时切短的**，于是末尾残留的半个字符
+    是我们自己造成的，该丢掉重试；`truncated=False` 表示文件本身就没解完，
+    那它多半是二进制，**不能**靠回退把它当文本悄悄返回。
+
+    （"是不是二进制"的判断留在调用方——这里返回 None 而不是一句现成的错误文案，
+    否则调用方只能靠字符串前缀去认结果，那种耦合迟早出错。）
+
+    抽成独立函数是为了可测：原实现靠 `max_bytes` 参数构造"切在字中间"的输入，
+    参数删掉后，这里直接喂裸字节——覆盖不丢，也不用造 64000 字节的测试文件。
+    """
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         if not truncated:
-            return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
-        # 按字节截断可能正好切在多字节字符中间——中文每字 3 字节，这很常见。
-        # 回退到最后一个完整字符边界，而不是把整份中文文本误报成二进制文件。
+            return None
+        # 一个字符最多 4 字节，所以切点离字符边界最多 3 字节，退到 3 就够。
         for backoff in (1, 2, 3):
             if len(data) <= backoff:
                 break
@@ -121,7 +127,21 @@ async def _read_file(path: str, max_bytes: int = 64000) -> str:
                 return data[:-backoff].decode("utf-8")
             except UnicodeDecodeError:
                 continue
+    return None
+
+
+async def _read_file(path: str) -> str:
+    target = Path(path).expanduser()
+    if not target.is_file():
+        return f"文件不存在：{target}"
+
+    truncated = target.stat().st_size > _READ_CAP_BYTES
+    with target.open("rb") as handle:
+        data = handle.read(_READ_CAP_BYTES)
+    decoded = decode_text(data, truncated=truncated)
+    if decoded is None:
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
+    return decoded
 
 
 # ---------- write_file ----------
@@ -214,7 +234,10 @@ TOOLS: dict[str, Tool] = {
         ),
         Tool(
             name="read_file",
-            description="读取一个文本文件的内容。",
+            description=(
+                "读取一个文本文件的内容。一次最多返回 8000 字符，超出部分会被截断"
+                "并标注原文长度——没有可以调大这个上限的参数，不要为此重试更大的值。"
+            ),
             params=ReadFileParams,
             risk=Risk.READ,
             fn=_read_file,
