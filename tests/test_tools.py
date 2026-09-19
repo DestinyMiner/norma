@@ -462,6 +462,22 @@ async def test_a_capped_file_mid_page_says_more_follows_within_what_is_readable(
     assert "读不到了" not in marker
 
 
+async def test_an_empty_file_is_reported_as_empty_not_as_a_bad_offset(tmp_path):
+    """空文件是**文件的性质**，不是模型填错了 offset。
+
+    说成"偏移 0 超出文件长度"会把它引到错误的方向：去改那个本来就是 0 的 offset，
+    而不是得出"这个文件没内容"的结论——一次白烧的调用。
+    """
+    f = tmp_path / "empty.txt"
+    f.write_bytes(b"")
+
+    out = await TOOLS["read_file"].fn(path=str(f))
+
+    assert "空" in out
+    assert "超出文件长度" not in out
+    assert "0 字节" in out
+
+
 async def test_offset_past_the_end_says_so_instead_of_returning_nothing(tmp_path):
     """越界必须说清，不能返回空串。
 
