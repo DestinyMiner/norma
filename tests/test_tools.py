@@ -106,14 +106,47 @@ def test_read_file_description_teaches_paging():
     上限在哪；接着它为一个 16848 字符的文件调了 3 次 `read_file` 却只读到开头一半，
     因为它**没有任何地方**能知道该怎么读第二段。所以描述必须同时说清：
       * 上限是多少（8000），没有调大它的参数——否则就是那次烧步数的重演
-      * 怎么翻页（offset 设成已读字符数、别重复读同一段）
+      * 怎么翻页（offset 设成**已读的字符数**、别重复读同一段）
     """
     description = openai_schema(TOOLS["read_file"])["function"]["description"]
 
     assert "8000" in description
-    assert "offset" in description
     assert "不要重复读同一段" in description
     assert "没有能把上限调大的参数" in description
+    assert "已读的字符数" in description      # 与 system prompt 同一句话（见下一条）
+
+
+def test_the_prompt_and_the_description_teach_the_same_paging():
+    """**两处必须说同一件事，而且要能被执行层面验尸。**
+
+    模型在两个不同时刻读到这两串字：描述每轮随 schema 下发，prompt 在对话最前面。
+    说法不同就等着被误导——而且这种错**不会让任何既有测试变红**：只要两边都含
+    "offset" 这个词，测试就绿，而模型可能拿着错的那个值永远重读同一页。
+
+    真实翻车过一次：描述写"**上次读到的**字符数"（读起来是"上一页有多宽"，= 7965），
+    prompt 写"**已读的**字符数"（累计，= 15934）。照前者算，第二页会被无限重读
+    （实测 8 次调用、只覆盖 63724 字符中的同一段）。
+
+    所以这条测试盯的是**那个词**，不是"提到了 offset"：
+      * 认**累计**语义（已读的字符数），不认**页宽**语义（上次读到的/本次读到的字符数）
+      * 也拒绝按字节的历史写法（那会让模型算错位置）
+    """
+    from norma.agent import DEFAULT_SYSTEM_PROMPT
+
+    texts = {
+        "system prompt": DEFAULT_SYSTEM_PROMPT,
+        "工具描述": TOOLS["read_file"].description,
+    }
+    for where, text in texts.items():
+        assert "已读的字符数" in text, f"{where} 没说清 offset 该填什么"
+        assert "不要重复读同一段" in text, f"{where} 没说不许重复读"
+        assert "上次读到的字符数" not in text, f"{where} 用了页宽语义（会无限重读第二页）"
+        assert "本次读到的字符数" not in text, f"{where} 用了页宽语义（会无限重读第二页）"
+
+    # 参数本身的说明（模型每轮同样读得到）必须与上面一致：按字符、不按字节
+    offset_field = TOOLS["read_file"].params.model_fields["offset"]
+    assert "字符" in offset_field.description
+    assert "字节" not in offset_field.description
 
 
 async def test_read_file_missing(tmp_path):
@@ -393,6 +426,34 @@ async def test_offset_past_the_end_says_so_instead_of_returning_nothing(tmp_path
     for out in (at_end, past_end):
         assert "超出文件长度" in out
         assert str(len(text)) in out
+
+
+async def test_past_the_end_of_a_capped_file_also_reports_the_cap(tmp_path):
+    """超过读取上限的文件，翻到最后一页之后也必须说清"后面读不到了"。
+
+    否则模型看到的是一句干巴巴的"共 24000 字符"，会以为**文件就这么长**——
+    页标记里那句"只读了开头"它已经看不到了（这是它对这个文件的最后一次读）。
+    实测：72000 字符的文件翻到第 4 页之后正是这个形态。
+    """
+    from norma.tools import _READ_CAP_BYTES
+
+    text = "x" * 72000
+    f = tmp_path / "huge.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    # 一路翻到底
+    offset, pages = 0, 0
+    while pages < 20:
+        out = await TOOLS["read_file"].fn(path=str(f), offset=offset)
+        if "超出文件长度" in out:
+            break
+        offset += len(out.split("\n", 1)[1])
+        pages += 1
+
+    assert "超出文件长度" in out
+    assert str(len(text)) in out                 # 文件真实长度
+    assert "只读了开头" in out                    # 以及"读不到后面"这件事
+    assert str(_READ_CAP_BYTES) in out
 
 
 @pytest.mark.parametrize("bad", [{"offset": -1}, {"limit": 0}, {"limit": -5}])

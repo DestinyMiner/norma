@@ -202,7 +202,12 @@ async def _read_file(
 
     total = len(text)
     if offset >= total:
-        return f"偏移 {offset} 超出文件长度（共 {total} 字符）：{target}"
+        # 翻过头了。超过内部上限的文件要在这里也说明"只读到开头"——否则模型翻到
+        # 最后一页时看到的是干巴巴一句"共 24000 字符"，会以为**文件就这么长**，
+        # 而实际上后面还有读不到的部分（页标记里有说明，这条消息里没有）。
+        beyond = f"；文件共 {size} 字节，只读了开头 {_READ_CAP_BYTES} 字节" \
+            if size > _READ_CAP_BYTES else ""
+        return f"偏移 {offset} 超出文件长度（可读部分共 {total} 字符{beyond}）：{target}"
 
     limit = min(limit, MAX_RESULT_CHARS)   # 可以往小调，不能往大调
     note = _size_note(size) if size > _READ_CAP_BYTES else ""
@@ -320,11 +325,15 @@ TOOLS: dict[str, Tool] = {
         ),
         Tool(
             name="read_file",
+            # 措辞与 agent.py 的 DEFAULT_SYSTEM_PROMPT **必须一致**：模型在两个不同时刻
+            # 读到它们（描述每轮随 schema 下发，prompt 在对话最前面），说法不同就等着被
+            # 误导。实测过一次真实的翻车：这里写"上次读到的字符数"（= 上一页的页宽）、
+            # prompt 写"已读的字符数"（= 累计），模型照前者算就会**永远重读第二页**。
             description=(
                 "读取一个文本文件的内容，可以指定读哪一段。offset 是起始字符位置"
                 "（0 起算），limit 是最多返回的字符数（默认且最大 8000，开头的进度"
                 "标记也算在内）。返回内容开头会标明这是第几到第几个字符、后面还有没有"
-                "——文件比一次能读的长时，把 offset 设成上次读到的字符数接着往下读，"
+                "——文件比一次能读的长时，把 offset 设成已读的字符数接着往下读，"
                 "不要重复读同一段；也没有能把上限调大的参数。"
             ),
             params=ReadFileParams,
