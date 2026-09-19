@@ -220,17 +220,20 @@ async def test_a_cut_landing_mid_character_is_not_reported_as_binary(tmp_path):
     """读取上限正好落在多字节字符中间时，那半个字符是**我们切出来的**，不是二进制。
 
     中文每字 3 字节，64000 不是 3 的倍数，所以"截在字符中间"是常态而非巧合。
-    这里直接构造那个字节边界（64000 字节的汉字文本），确认不会误报二进制。
+    构造要是**真的超过上限**的文件（64001 字节），上限那一刀就落在汉字中间；
+    文件正好 64000 字节时不算被切——那半个字是文件的性质，按二进制报才对
+    （见 test_a_complete_file_whose_tail_is_invalid_is_reported_as_binary）。
     """
     from norma.tools import _READ_CAP_BYTES
 
     f = tmp_path / "cn.txt"
-    f.write_bytes(("中" * 22000).encode("utf-8")[:_READ_CAP_BYTES])
+    f.write_bytes(("中" * 22000).encode("utf-8")[:_READ_CAP_BYTES + 1])
 
     out = await TOOLS["read_file"].fn(path=str(f))
 
     assert "无法按 UTF-8 解码" not in out
     assert out.startswith("…[第 1-")
+    assert "只读了开头" in out            # 确实是被我们切的
 
 
 async def test_read_file_does_not_mark_files_it_read_whole(tmp_path):
@@ -285,7 +288,7 @@ async def test_paging_through_a_file_reaches_the_end(tmp_path):
         if offset >= len(text):
             break
 
-    assert len(collected) == 3                  # 16848 / 8000 → 3 页
+    assert len(collected) <= 3                  # 16848 字符 / 一页约 8000 → 3 页够
     assert "".join(collected) == text
     assert offset == len(text)
 
@@ -487,13 +490,9 @@ def test_the_page_budget_reserves_the_longest_possible_marker():
 async def test_the_emitted_page_fills_the_ceiling_exactly(tmp_path):
     """一页必须**正好**用满 8000；被收尾截断啃掉一个字符就算坏。
 
-    这条是被一个存活变异逼出来的：把预算那一步的"最长标记"改成用**短**标记估，
-    154 条测试全绿。为什么会绿——预算估短了，正文就多给了几个字符，总数超出 8000，
-    然后被 `result[:MAX_RESULT_CHARS]` 悄悄截掉尾巴：
-    **没有任何报错，只是页比它自己声明的短了一点点**（标记说"到第 N 字符"，实际只到 N-1）。
-    模型拿这个 N 算下一个 offset 就会漏读字符。
-
-    所以判据不能是"没超上限"（截断保证了它），而得是"用满了上限、且与声明一致"。
+    判据不能是"没超上限"——截断保证了它。真正的坏法是预算估短了、正文多给几个字符、
+    然后被 `result[:MAX_RESULT_CHARS]` 悄悄截掉尾巴：**没有任何报错，只是页比它自己
+    声明的短**，而模型拿这个 N 算下一个 offset 就会漏读字符。
     """
     text = "字" * 20000                       # 60000 字节，未到 64 KiB 墙
     f = tmp_path / "novel.txt"
@@ -507,6 +506,56 @@ async def test_the_emitted_page_fills_the_ceiling_exactly(tmp_path):
     assert len(chunk) == declared             # 声明到哪就真到哪
     assert chunk == text[:declared]
     assert "后面还有" in marker                # 这一页确实不是最后一页
+
+
+@pytest.mark.parametrize("limit", [7968, 7969, 7970, 7971, 7972, 7973, 7990, 8000])
+async def test_no_limit_near_the_ceiling_makes_the_marker_lie(tmp_path, limit):
+    """**回归测试**：`limit` 贴着上限时，标记绝不许声明得比正文多。
+
+    实测过的那一档（`limit=7970, total=10000`）：预算按 `shown=total` 那版标记估，
+    而那一版**带不上尾注**（少 5 个字符），于是正文多给几个字符、总数超 8000、
+    收尾截断把尾巴削掉——标记写"第 1-7970"、实际只给了 7969。
+    模型照着标记往后读，第 7970 个字符就永远读不到了。
+
+    `limit` 取一串贴着上限的值，因为坏窗口只有几个字符宽，单点容易漏。
+    """
+    text = "n" * 10000
+    f = tmp_path / "lies.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    out = await TOOLS["read_file"].fn(path=str(f), limit=limit)
+    marker, chunk = out.split("\n", 1)
+    declared = int(marker.split("-")[1].split(" ")[0])
+
+    assert len(chunk) == declared, f"limit={limit}：标记声明 {declared}，实际 {len(chunk)}"
+    assert chunk == text[:declared]
+    assert len(out) <= MAX_RESULT_CHARS
+
+
+async def test_paging_with_a_near_ceiling_limit_loses_no_characters(tmp_path):
+    """贴着上限翻页也不许漏字——把"声明即下一个 offset"这条链走完。
+
+    一条一条读下去，每一页都按标记声明的终点接上，最后拼起来必须**等于原文**。
+    这是终局影响：漏一个字符在小说场景里就是少读一句，而循环不会报任何错。
+    """
+    text = "".join(f"<{i:05d}>" for i in range(1500))     # 10000 字符
+    f = tmp_path / "paged.txt"
+    f.write_bytes(text.encode("utf-8"))
+
+    got, offset, pages = "", 0, 0
+    while pages < 20:
+        out = await TOOLS["read_file"].fn(path=str(f), offset=offset, limit=7972)
+        if "超出文件长度" in out:
+            break
+        marker, chunk = out.split("\n", 1)
+        declared_end = int(marker.split("-")[1].split(" ")[0])
+        assert len(chunk) == declared_end - offset, "标记声明与正文长度不符"
+        got += chunk
+        offset = declared_end
+        pages += 1
+
+    assert got == text
+    assert offset == len(text)
 
     # 回到真实尺度再验一遍真产物：70000 字节的文件必须正好卡在上限内
     # （见 test_limit_cannot_exceed_the_hard_result_ceiling，那条跑的是真的读文件）
@@ -602,32 +651,54 @@ async def test_a_cut_in_the_middle_of_a_character_is_not_reported_as_binary(tmp_
 
 
 @pytest.mark.parametrize(
-    "cut,expected",
+    "at,expected",
     [(4, "好"), (5, "好"), (6, "好"), (7, "好😀")],
 )
-def test_every_byte_cut_of_a_four_byte_character_decodes(cut, expected):
+def test_every_byte_cut_of_a_four_byte_character_decodes(at, expected):
     """**每一个**可能的字节切点都要能解出来——这是中文文本不被误报成二进制的全部保证。
 
     固定退 1/2/3 字节在这里是够的（一个字符最多 4 字节，切点离边界最多 3 字节），
     但"够"要靠枚举证明，不能靠推理：这四条覆盖了 4 字节字符的每一个切点。
-    （旧实现有 `truncated` 参数来区分"我们切坏的"与"文件本身坏"；整块读之后
-    这个参数没意义了，回退无条件生效——见下一条测试。）
+
+    `cut=True` 是调用方给的信号（它知道文件超过读取上限）。**这个信号不能省**——
+    见下一条。
     """
-    assert _decode_or_none("好😀".encode("utf-8")[:cut]) == expected
+    assert _decode_or_none("好😀".encode("utf-8")[:at], cut=True) == expected
 
 
-def test_a_complete_binary_file_is_still_reported_as_binary():
-    """回退不是万能的：坏字节在**中间**时，退末尾救不回来，必须报二进制。
+def test_a_complete_file_whose_tail_is_invalid_is_reported_as_binary():
+    """**回归测试**：完整文件（没被我们切过）末尾有坏字节 → 它是二进制，不是文本。
 
-    （盲目退 1/2/3 字节会把 `abc\\xff\\xfe` 变成 `abc` 返回——把二进制当文本悄悄
-    读出来。所以回退只在出错区间**顶到末尾**时才做：那才是"我们切出来的半个字符"。）
+    实测过的一次真回归：把"是不是我们切的"这个判断去掉、无条件退 1/2/3 字节之后，
+    下面这些都成了"文本"（尾巴被悄悄丢掉）：
+
+        b"abc\\xff"      → "abc"
+        b"MZ\\x00\\x00\\xff" → "MZ\\x00\\x00"
+        "café".encode("latin-1") → "caf"
+
+    v1.0.1 把四个都判成二进制，而**二进制文件的尾巴常常正好是坏的**——
+    光看"末尾有坏字节"分不出是谁造成的，只有调用方知道文件有没有被切过。
     """
-    assert _decode_or_none(b"abc\xff\xfe") is None
+    for data in (b"abc\xff", b"MZ\x00\x00\xff", b"PK\x03\x04" + b"\x00" * 20 + b"\xff",
+                 "café".encode("latin-1")):
+        assert _decode_or_none(data, cut=False) is None, data
+
+
+def test_the_same_bytes_decode_when_they_were_cut_by_the_read_cap():
+    """同样末尾有坏字节，但**是我们切的**（cut=True）→ 该救回来。
+
+    两条合起来才是完整的判断：坏字节在末尾时，"是谁造成的"决定它是二进制
+    还是被我们切断的中文。
+    """
+    assert _decode_or_none("中文".encode("utf-8")[:-1], cut=True) == "中文".encode(
+        "utf-8")[:-1].decode("utf-8", "ignore") + ""      # 退掉半个字 → 只剩"中"
+    assert _decode_or_none("中文".encode("utf-8"), cut=True) == "中文"
 
 
 def test_binary_corruption_in_the_middle_is_not_masked_by_the_backoff():
-    """同一个坑的另一种形态：末尾合法、坏在中间。"""
-    assert _decode_or_none("中文".encode("utf-8") + b"\xff\xfe" + "好".encode("utf-8")) is None
+    """坏在中间、末字节合法：退末尾救不回来，必须报二进制。"""
+    assert _decode_or_none(
+        "中文".encode("utf-8") + b"\xff\xfe" + "好".encode("utf-8"), cut=True) is None
 
 
 # ---------- write_file ----------

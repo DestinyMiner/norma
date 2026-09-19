@@ -108,34 +108,35 @@ class ReadFileParams(BaseModel):
     )
     limit: int = Field(
         MAX_RESULT_CHARS, ge=1,
+        # "标记也算在内"是**错的**：标记不从 limit 里扣，它是额外的（总结果仍不超过
+        # MAX_RESULT_CHARS）。已实测：limit=5 会返回 31 字符——5 个正文 + 标记。
         description=(
-            f"最多返回多少字符（默认且最大 {MAX_RESULT_CHARS}；开头的进度标记也算在内）。"
-            "没有调大它的办法，想多读就往后翻页"
+            f"最多返回多少字符（默认且最大 {MAX_RESULT_CHARS}）。正文最多这么多，"
+            "开头那句进度标记另算；整条结果不超过 "
+            f"{MAX_RESULT_CHARS}。没有调大它的办法，想多读就往后翻页"
         ),
     )
 
 
-def _decode_or_none(data: bytes) -> str | None:
+def _decode_or_none(data: bytes, *, cut: bool) -> str | None:
     """解码 UTF-8；解不开就退掉末尾残片再试，还是不行则返回 None（= 二进制）。
 
-    末尾残片是**读取上限切出来的**：`_READ_CAP_BYTES` 可能正好落在多字节字符中间
-    （中文每字 3 字节，这很常见）。它是我们造成的，该丢掉而不是把整份中文误报成二进制。
+    `cut=True` 只表示**这批字节是被读取上限切短的**。这个信号必须由调用方给进来
+    （它知道 `size > _READ_CAP_BYTES`），不能靠猜：`UnicodeDecodeError` 的出错区间
+    顶到末尾**并不能**证明是我们切的——文件本身末尾有坏字节时也是这样。
 
-    **只在该位置确实是"切出来的半个字符"时才退**：`UnicodeDecodeError` 会告诉我们
-    出错区间，只有它顶到缓冲区末尾（`end == len(data)`）才说明后面还缺字节；
-    中间出现的坏字节是真的坏（`b"abc\\xff\\xfe"` 退两个字节会得到 `abc`，那是把
-    二进制当文本悄悄返回——v1.0.1 特意保住的判断，别丢）。
-    一个字符最多 4 字节，所以残片最多 3 字节——"够"由
-    `test_every_byte_cut_of_a_four_byte_character_decodes` 逐个切点枚举证明。
+    代价是实测过的一次真回归：把 `cut` 去掉、无条件退 1/2/3 字节之后，
+    `b"abc\\xff"`、`b"MZ\\x00\\x00\\xff"`、latin-1 的 `'café'.encode()` 全都被
+    当成文本悄悄返回（尾巴被丢掉）——9 个用例，v1.0.1 都判它们是二进制。
+    二进制文件的尾巴常常正好是坏的，所以"末尾坏字节"这件事**分不出**是谁造成的。
 
-    只让调用方（`_read_file`）关心"是不是二进制"：返回 None 而不是一句现成的
-    错误文案，否则调用方只能靠字符串前缀去认结果，那种耦合迟早出错。
+    退的字节数由出错区间限住（一个字符最多 4 字节），所以不会退过头把好内容也丢了。
     """
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        if exc.end != len(data):
-            return None                     # 坏在中间：文件本身就不是文本
+        if not cut:
+            return None                     # 完整文件解不开 = 它就不是文本
         for backoff in range(1, min(exc.end - exc.start, 3) + 1):
             if len(data) <= backoff:
                 break
@@ -203,10 +204,11 @@ async def _read_file(
         return f"文件不存在：{target}"
 
     size = target.stat().st_size
+    cut = size > _READ_CAP_BYTES
     with target.open("rb") as handle:
         data = handle.read(_READ_CAP_BYTES)
 
-    text = _decode_or_none(data)
+    text = _decode_or_none(data, cut=cut)
     if text is None or (not text and data):
         # 后者只在"整块都是半个字符"时成立（文件小到连一个完整字符都装不下）。
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
@@ -221,11 +223,11 @@ async def _read_file(
         # 最后一页时看到的是干巴巴一句"共 24000 字符"，会以为**文件就这么长**，
         # 而实际上后面还有读不到的部分（页标记里有说明，这条消息里没有）。
         beyond = f"；文件共 {size} 字节，只读了开头 {_READ_CAP_BYTES} 字节" \
-            if size > _READ_CAP_BYTES else ""
+            if cut else ""
         return f"偏移 {offset} 超出文件长度（可读部分共 {total} 字符{beyond}）：{target}"
 
     limit = min(limit, MAX_RESULT_CHARS)   # 可以往小调，不能往大调
-    note = _size_note(size) if size > _READ_CAP_BYTES else ""
+    note = _size_note(size) if cut else ""
 
     if not note and offset == 0 and total <= limit:
         # 整个文件一次给完了——没有"是哪一段""后面还有没有"可说的。
@@ -234,20 +236,24 @@ async def _read_file(
 
     # 标记**占额度**，而且额度从**总上限**里扣、不从模型要的 limit 里扣：
     #   * 从 limit 里扣的话，`limit=5` 会被标记吃光、返回空内容——模型要 5 个字就给它 5 个字；
-    #   * 但总额度必须守住 MAX_RESULT_CHARS，因为 `Agent` 那层 `truncate()` 只保留这么多字符，
-    #     超出的部分会被它砍掉，而页标记说的"到第 N 字符"就成了假话。
+    #   * 但总额度必须守住 MAX_RESULT_CHARS，因为 `Agent` 那层 `truncate()` 只保留这么多字符。
     #
-    # 先按最长的那版标记估一个正文长度（不必迭代求解），再按真实标记修正一次：
-    # 估算偏长会白白少给几个字，而**页的边界必须正好**——模型是拿标记里的数字
-    # 去算下一个 offset 的，少给一个字就少读一个字（`test_the_page_marker_...` 守着这条）。
-    longest = _page_marker(offset, total, total, note)
+    # 估算必须覆盖**最长**的那版标记，包括尾注：`shown=total` 那一版**带不上**尾注
+    # （`offset + shown < total` 不成立），所以它不是最长的。漏掉这 5 个字符的后果
+    # 实测过一次——正文多给几个字符 → 总数超 8000 → 被下面那行 `[:MAX_RESULT_CHARS]`
+    # 悄悄截掉尾巴 → **页比它自己声明的短**，而模型正是拿那个声明算下一个 offset，
+    # 于是漏读字符（`limit=7970/7972` 那一档能稳定复现）。所以显式把尾注加进估算。
+    longest = _page_marker(offset, total, total, note) + _PAGE_TAIL
     budget = max(1, MAX_RESULT_CHARS - len(longest) - 1)          # -1 是标记后那个换行
     chunk = text[offset:offset + min(limit, budget)]
     if len(chunk) < limit:                                        # 还有额度就补满
         room = MAX_RESULT_CHARS - len(_page_marker(offset, len(chunk), total, note)) - 1
         chunk = text[offset:offset + min(limit, max(1, room))]
     result = f"{_page_marker(offset, len(chunk), total, note)}\n{chunk}"
-    return result[:MAX_RESULT_CHARS]
+    # 估算覆盖了最长标记之后这里**进不来**；留着当断言用，真进来就是估算漏了一档。
+    assert len(result) <= MAX_RESULT_CHARS, (
+        f"页标记+正文超过上限（{len(result)}），估算漏了一档：{result[:80]!r}")
+    return result
 
 
 # ---------- write_file ----------
@@ -346,10 +352,11 @@ TOOLS: dict[str, Tool] = {
             # prompt 写"已读的字符数"（= 累计），模型照前者算就会**永远重读第二页**。
             description=(
                 "读取一个文本文件的内容，可以指定读哪一段。offset 是起始字符位置"
-                "（0 起算），limit 是最多返回的字符数（默认且最大 8000，开头的进度"
-                "标记也算在内）。返回内容开头会标明这是第几到第几个字符、后面还有没有"
-                "——文件比一次能读的长时，把 offset 设成已读的字符数接着往下读，"
-                "不要重复读同一段；也没有能把上限调大的参数。"
+                "（0 起算），limit 是最多返回多少**正文**字符（默认且最大 8000，"
+                "开头那句进度标记另算，整条结果不超过 8000）。返回内容开头会标明"
+                "这是第几到第几个字符、后面还有没有——文件比一次能读的长时，"
+                "把 offset 设成已读的字符数接着往下读，不要重复读同一段；"
+                "也没有能把上限调大的参数。"
             ),
             params=ReadFileParams,
             risk=Risk.READ,
