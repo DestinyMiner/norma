@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from norma.agent import DEFAULT_SYSTEM_PROMPT, Agent, ExecResult
 from norma.events import Failed, Finished, TextDelta, ToolCallStarted, ToolResult
 from norma.llm import Reply, ToolCall
-from norma.tools import Risk, Tool
+from norma.tools import MAX_RESULT_CHARS, TOOLS, Risk, Tool
 
 
 class EchoParams(BaseModel):
@@ -541,6 +541,38 @@ async def test_a_client_supplied_system_message_is_not_overwritten():
 
     assert [m["role"] for m in agent.messages] == ["system", "user", "assistant"]
     assert agent.messages[0]["content"] == "客户端规则"
+
+
+# ---------- 跨模块：read_file 的标记要活着穿过 truncate() ----------
+
+async def test_read_file_size_marker_survives_the_truncation_layer(tmp_path):
+    """**集成测试**：`read_file` 那句"文件共 N 字节"必须真的到得了模型眼前。
+
+    只测工具函数是不够的——工具输出还要过 `Agent` 那层 `truncate()`，它只保留前
+    8000 字符。标记若追加在 64 KiB 文本的**末尾**，就永远被砍掉，于是模型看到的
+    仍是"原文 64000 字符"并把它当成文件大小——这个功能只在它唯一该起作用的那种
+    情况下失效。（审查抓到过这个：四个逐任务审查都只调了工具函数，没走 Agent。）
+
+    这里走完整的 `Agent.execute`，断言模型**收到**的那条 tool 消息。
+    """
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 4000000, encoding="utf-8")
+
+    agent = Agent(
+        llm=None,
+        tools={"read_file": TOOLS["read_file"]},
+        ask_permission=allow,
+        system_prompt="",
+    )
+    result = await agent.execute(
+        ToolCall("c1", "read_file", {"path": str(big)}))
+
+    assert result.ok is True
+    assert "文件共 4000000 字节" in result.content      # 真实大小，活过了截断
+    assert "已截断，原文" in result.content             # 截断层也照常标记
+    assert len(result.content) <= MAX_RESULT_CHARS + 40
+    # 标记在开头，所以 x 那一大片填不满前 8000 字符
+    assert result.content.count("x") < MAX_RESULT_CHARS
 
 
 def test_default_system_prompt_covers_the_observed_defects():

@@ -143,10 +143,13 @@ async def _read_file(path: str) -> str:
     if decoded is None:
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
     if truncated:
-        # 这道标记是必须的：不加的话，下面 truncate() 那层标注的"原文 N 字符"
-        # 报的是**我们读进来的那一段**，模型会把它当成整个文件的长度——
-        # 又是一次"工具说了不真的话"。这里报的 size 才是文件真实大小。
-        return f"{decoded}\n…[文件共 {size} 字节，这里只读了开头 {_READ_CAP_BYTES} 字节]"
+        # 这道标记必须放在**开头**，不能追加在末尾：调用方那层 truncate() 只保留前
+        # 8000 字符，而这段文本有 64 KiB——追加在末尾的标记永远到不了模型眼前，
+        # 于是模型看到的还是"原文 64000 字符"，把它当成文件大小。这个功能只会在
+        # 它唯一该起作用的那种情况下失效。
+        return (
+            f"…[文件共 {size} 字节，这里只读了开头 {_READ_CAP_BYTES} 字节]\n{decoded}"
+        )
     return decoded
 
 
