@@ -40,7 +40,7 @@ norma
 ```
 
 输入自然语言即可。读写文件与执行命令前会先询问（只读操作不询问）。
-每次工具调用都记入 `norma.log`。
+每次工具调用都记入 `~/.norma/audit.log`（启动时会打印完整路径）。
 
 ## 测试
 
@@ -54,6 +54,8 @@ python -m pytest
 
 1. 定义 pydantic 参数模型
 2. 写一个 async 函数，返回字符串
-3. 在 `src/norma/tools.py` 的 `TOOLS` 里加一行（含 `risk` 等级）
+3. 在 `src/norma/tools.py` 的 `TOOLS` 里加一项，五项都要写全：
+   `name` / `description` / `params` / `risk` / `fn`
 
 模型的 tool 定义由 pydantic 模型自动生成，无需手写 JSON Schema。
+工具结果统一在 `Agent` 那层截断到 8000 字符，单个工具不必自己管这件事。
