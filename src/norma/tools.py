@@ -99,30 +99,43 @@ async def _list_dir(path: str = ".") -> str:
 
 class ReadFileParams(BaseModel):
     path: str = Field(..., description="要读取的文件路径")
+    offset: int = Field(
+        0, ge=0,
+        description="从第几个字符开始读（0 起算）。接着上次读到的地方继续，就把它设成已读字符数",
+    )
+    limit: int = Field(
+        MAX_RESULT_CHARS, ge=1,
+        description=(
+            f"最多返回多少字符（默认且最大 {MAX_RESULT_CHARS}；开头的进度标记也算在内）。"
+            "没有调大它的办法，想多读就往后翻页"
+        ),
+    )
 
 
-def decode_text(data: bytes, *, truncated: bool) -> str | None:
-    """把读进来的字节解码成文本；`None` 表示这不是 UTF-8 文本。
+def _decode_or_none(data: bytes) -> str | None:
+    """解码 UTF-8；解不开就退掉末尾残片再试，还是不行则返回 None（= 二进制）。
 
-    `truncated=True` 只表示**这批字节是被读文件时切短的**，于是末尾残留的半个字符
-    是我们自己造成的，该丢掉重试；`truncated=False` 表示文件本身就没解完，
-    那它多半是二进制，**不能**靠回退把它当文本悄悄返回。
+    末尾残片是**读取上限切出来的**：`_READ_CAP_BYTES` 可能正好落在多字节字符中间
+    （中文每字 3 字节，这很常见）。它是我们造成的，该丢掉而不是把整份中文误报成二进制。
 
-    （"是不是二进制"的判断留在调用方——这里返回 None 而不是一句现成的错误文案，
-    否则调用方只能靠字符串前缀去认结果，那种耦合迟早出错。）
+    **只在该位置确实是"切出来的半个字符"时才退**：`UnicodeDecodeError` 会告诉我们
+    出错区间，只有它顶到缓冲区末尾（`end == len(data)`）才说明后面还缺字节；
+    中间出现的坏字节是真的坏（`b"abc\\xff\\xfe"` 退两个字节会得到 `abc`，那是把
+    二进制当文本悄悄返回——v1.0.1 特意保住的判断，别丢）。
+    一个字符最多 4 字节，所以残片最多 3 字节——"够"由
+    `test_every_byte_cut_of_a_four_byte_character_decodes` 逐个切点枚举证明。
 
-    抽成独立函数是为了可测：原实现靠 `max_bytes` 参数构造"切在字中间"的输入，
-    参数删掉后，这里直接喂裸字节——覆盖不丢，也不用造 64000 字节的测试文件。
+    只让调用方（`_read_file`）关心"是不是二进制"：返回 None 而不是一句现成的
+    错误文案，否则调用方只能靠字符串前缀去认结果，那种耦合迟早出错。
     """
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
-        if not truncated:
-            return None
-        # 一个字符最多 4 字节，所以切点离字符边界最多 3 字节，退到 3 就够。
-        for backoff in (1, 2, 3):
+    except UnicodeDecodeError as exc:
+        if exc.end != len(data):
+            return None                     # 坏在中间：文件本身就不是文本
+        for backoff in range(1, min(exc.end - exc.start, 3) + 1):
             if len(data) <= backoff:
-                continue
+                break
             try:
                 return data[:-backoff].decode("utf-8")
             except UnicodeDecodeError:
@@ -130,27 +143,91 @@ def decode_text(data: bytes, *, truncated: bool) -> str | None:
     return None
 
 
-async def _read_file(path: str) -> str:
+_PAGE_TAIL = "，后面还有"
+
+# 页标记里"文件只读了开头 N 字节"那一句——空串表示不写（见 _page_marker）
+_SIZE_NOTE = f"（文件共 {{size}} 字节，只读了开头 {_READ_CAP_BYTES} 字节）"
+
+
+def _page_marker(offset: int, shown: int, total: int, size_note: str = "") -> str:
+    """区间读取的进度标记。
+
+    标记回答模型两个问题：这是第几到第几个字符、后面还有没有。
+
+    `size_note` 非空表示"文件比读取上限长，我们只读了开头"：这时 `total` 只是**读到的那段**
+    的长度，必须同时报出文件真实字节数，否则模型会把 `total` 当成整个文件的长度
+    ——"工具说了不真的话"，正是 v1.0.1 要消灭的那类毛病（终局审查抓到过它的另一种形态：
+    标记写在末尾被 truncate 砍掉，等于没写）。
+
+    **调用方必须把它放在结果开头**：结果还要过 `Agent` 那层只保留前 8000 字符的截断。
+    """
+    head = f"…[第 {offset + 1}-{offset + shown} 字符，共 {total} 字符{size_note}"
+    if offset + shown < total:
+        head += _PAGE_TAIL
+    return head + "]"
+
+
+def _size_note(size: int) -> str:
+    return _SIZE_NOTE.format(size=size)
+
+
+async def _read_file(
+    path: str, offset: int = 0, limit: int = MAX_RESULT_CHARS
+) -> str:
+    """读文件的**一个区间**。offset/limit 都按字符数（不是字节）。
+
+    为什么要能翻页：实验里模型为 16848 字符的文件调了 3 次 `read_file`，够了却只读到
+    开头一半——因为每次都从第 0 个字符开始。**线性读取没有游标时，重试同一个工具
+    永远在原地打转。**
+
+    实现是"整块解码 + 字符切片"，不是增量分块：字符语义的 offset 必须按字符数数过去，
+    而 UTF-8 是变长的，真分块就得处理"块首块尾各残留半个字符"——那是解码回退逻辑的
+    两倍复杂度，而 64 KiB 对本章节规模的文件是毫秒级。
+
+    ponytail: 整块读进内存再切片；若真出现"读 1 GB 文件的第 900 MB 处"的需求，
+              再改成流式解码 + 字节游标（那时才值得付分块解码的复杂度）。
+    """
     target = Path(path).expanduser()
     if not target.is_file():
         return f"文件不存在：{target}"
 
     size = target.stat().st_size
-    truncated = size > _READ_CAP_BYTES
     with target.open("rb") as handle:
         data = handle.read(_READ_CAP_BYTES)
-    decoded = decode_text(data, truncated=truncated)
-    if decoded is None:
+
+    text = _decode_or_none(data)
+    if text is None or (not text and data):
+        # 后者只在"整块都是半个字符"时成立（文件小到连一个完整字符都装不下）。
         return f"无法按 UTF-8 解码（可能是二进制文件）：{target}"
-    if truncated:
-        # 这道标记必须放在**开头**，不能追加在末尾：调用方那层 truncate() 只保留前
-        # 8000 字符，而这段文本有 64 KiB——追加在末尾的标记永远到不了模型眼前，
-        # 于是模型看到的还是"原文 64000 字符"，把它当成文件大小。这个功能只会在
-        # 它唯一该起作用的那种情况下失效。
-        return (
-            f"…[文件共 {size} 字节，这里只读了开头 {_READ_CAP_BYTES} 字节]\n{decoded}"
-        )
-    return decoded
+
+    total = len(text)
+    if offset >= total:
+        return f"偏移 {offset} 超出文件长度（共 {total} 字符）：{target}"
+
+    limit = min(limit, MAX_RESULT_CHARS)   # 可以往小调，不能往大调
+    note = _size_note(size) if size > _READ_CAP_BYTES else ""
+
+    if not note and offset == 0 and total <= limit:
+        # 整个文件一次给完了——没有"是哪一段""后面还有没有"可说的。
+        # 这时候不加标记：标记只回答区间读取带来的疑问，不该给每一份小文件都套一层壳。
+        return text
+
+    # 标记**占额度**，而且额度从**总上限**里扣、不从模型要的 limit 里扣：
+    #   * 从 limit 里扣的话，`limit=5` 会被标记吃光、返回空内容——模型要 5 个字就给它 5 个字；
+    #   * 但总额度必须守住 MAX_RESULT_CHARS，因为 `Agent` 那层 `truncate()` 只保留这么多字符，
+    #     超出的部分会被它砍掉，而页标记说的"到第 N 字符"就成了假话。
+    #
+    # 先按最长的那版标记估一个正文长度（不必迭代求解），再按真实标记修正一次：
+    # 估算偏长会白白少给几个字，而**页的边界必须正好**——模型是拿标记里的数字
+    # 去算下一个 offset 的，少给一个字就少读一个字（`test_the_page_marker_...` 守着这条）。
+    longest = _page_marker(offset, total, total, note)
+    budget = max(1, MAX_RESULT_CHARS - len(longest) - 1)          # -1 是标记后那个换行
+    chunk = text[offset:offset + min(limit, budget)]
+    if len(chunk) < limit:                                        # 还有额度就补满
+        room = MAX_RESULT_CHARS - len(_page_marker(offset, len(chunk), total, note)) - 1
+        chunk = text[offset:offset + min(limit, max(1, room))]
+    result = f"{_page_marker(offset, len(chunk), total, note)}\n{chunk}"
+    return result[:MAX_RESULT_CHARS]
 
 
 # ---------- write_file ----------
@@ -244,9 +321,11 @@ TOOLS: dict[str, Tool] = {
         Tool(
             name="read_file",
             description=(
-                "读取一个文本文件的内容。一次最多返回 8000 字符；超出会截断并标注"
-                "本次读到的长度——没有可以调大这个上限的参数，不要为此重试更大的值。"
-                "文件比这更大时会另有说明。"
+                "读取一个文本文件的内容，可以指定读哪一段。offset 是起始字符位置"
+                "（0 起算），limit 是最多返回的字符数（默认且最大 8000）。"
+                "返回内容开头会标明这是第几到第几个字符、后面还有没有——"
+                "文件比一次能读的长时，把 offset 设成已读的字符数接着读，"
+                "不要重复读同一段；也没有能把上限调大的参数。"
             ),
             params=ReadFileParams,
             risk=Risk.READ,
