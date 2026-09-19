@@ -101,6 +101,39 @@ def test_to_message_serializes_arguments_as_json_string():
     assert json.loads(raw) == {"a": 1}
 
 
+def test_a_paging_offset_survives_the_message_round_trip():
+    """区间读取多了一个"要原样带回去的大整数"，把这条缝也钉住。
+
+    `offset` 是 v1.1.0 才有的参数，值通常是几千到几万（如 15934）。它会走
+    ToolCall → `to_message()` → JSON 字符串 → 下一轮请求 → 服务端 → 再回来。
+    这中间任何一步把数字变成字符串、或者丢精度，模型下一轮就会从错的位置读
+    ——而循环本身不会报错，只会悄悄地少读/重读。
+
+    用**边界值**而不是"随便一个数"：JSON 里整数是安全的，但只有真跑一遍才知道
+    我们的实现有没有把它当字符串拼。
+    """
+    for offset in (0, 1, 7969, 15934):
+        reply = Reply(content="", tool_calls=[
+            ToolCall(id="c1", name="read_file",
+                     args={"path": "a.txt", "offset": offset, "limit": 8000}),
+        ])
+        raw = reply.to_message()["tool_calls"][0]["function"]["arguments"]
+
+        assert isinstance(raw, str)               # 必须是 JSON 字符串，不是 dict
+        back = json.loads(raw)
+        assert back["offset"] == offset           # 原样回去，没变成 "15934"
+        assert isinstance(back["offset"], int)    # 也没变成字符串
+        assert back["limit"] == 8000
+
+    # 顺带确认没被截断/转义弄坏：中文路径与负数（pydantic 会拦，但传输层不该自己改）
+    reply = Reply(content="", tool_calls=[
+        ToolCall(id="c1", name="read_file", args={"path": "小说/第一章.txt", "offset": 0}),
+    ])
+    raw = reply.to_message()["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(raw)["path"] == "小说/第一章.txt"
+    assert "\\u" not in raw                       # ensure_ascii=False：不该被转义成 \uXXXX
+
+
 def test_to_message_keeps_empty_content_as_none():
     reply = Reply(content="", tool_calls=[ToolCall(id="c1", name="t", args={})])
     assert reply.to_message()["content"] is None
